@@ -1,0 +1,36 @@
+# Paths are relative to this config file. Copy to profiles.toml and edit.
+[server]
+database = ".state/sessions.sqlite3"
+host = "127.0.0.1"
+port = 8081
+api_key_env = "PROXY_API_KEY"
+turn_timeout_seconds = 600
+task_model = "haiku" # Isolated Claude SDK calls with tools disabled.
+task_timeout_seconds = 60
+
+[profiles."claude-code:myrepo"]
+backend = "claude"
+cwd = "."
+model = "sonnet"
+permission_mode = "default"
+allowed_tools = ["Read", "Glob", "Grep"]
+system_prompt = "Help the user understand this repository. You have read-only tools."
+max_turns = 30
+
+[profiles."codex:myrepo"]
+backend = "codex"
+cwd = "."
+#model = "sonnet"
+permission_mode = "default"
+allowed_tools = []
+#allowed_tools = ["Read", "Glob", "Grep"]
+#system_prompt = "Help the user understand this repository. You have read-only tools."
+max_turns = 30
+
+# Enable after installing/authenticating the Codex CLI on the host.
+# [profiles."codex:myrepo"]
+# backend = "codex"
+# cwd = "."
+# permission_mode = "default"
+# allowed_tools = [] # Codex uses its read-only OS sandbox, not Claude tool names.
+
