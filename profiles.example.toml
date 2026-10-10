@@ -15,7 +15,12 @@ task_timeout_seconds = 60
 # api_key_env = "OPENWEBUI_API_KEY"
 # knowledge = true
 # memory = true
+# memory_path = "projects/myrepo" # Optional default retrieval/write path for this project.
+# memory_include_shared = true # Include user memories without a path in list/search.
 # memory_write = false # True allows add/update/delete without an approval UI.
+# notes = false # Enable listing, search, and Markdown reads.
+# notes_write = false # Requires notes=true; enables create/update/delete.
+# chat_history = false # Enable read-only search and reading of past chats.
 # knowledge_ids = [] # All bases accessible to the configured account.
 # timeout_seconds = 30
 
@@ -31,11 +36,15 @@ max_turns = 30
 # Optional profile overrides. Other settings inherit from [openwebui].
 # Without shared defaults, include url here to enable just this profile.
 # [profiles."claude-code:myrepo".openwebui]
+# memory_path = "projects/myrepo" # Override the shared default per project.
 # url = "http://127.0.0.1:3000"
 # api_key_env = "OPENWEBUI_API_KEY"
 # knowledge = true
 # memory = true
 # memory_write = false # Set true to allow add/update/delete without an approval UI.
+# notes = false
+# notes_write = false
+# chat_history = false
 # knowledge_ids = [] # Empty means all bases accessible to the configured user.
 # timeout_seconds = 30
 
@@ -50,10 +59,14 @@ max_turns = 30
 # table above (before any nested table).
 # Same overrides work for Codex; each profile can use its own key and allowlist.
 # [profiles."codex:myrepo".openwebui]
+# memory_path = "projects/myrepo" # Use the same path to share memory with Claude.
 # url = "http://127.0.0.1:3000"
 # api_key_env = "OPENWEBUI_API_KEY"
 # knowledge = true
 # memory = true
 # memory_write = false
+# notes = false
+# notes_write = false
+# chat_history = false
 # knowledge_ids = []
 # timeout_seconds = 30

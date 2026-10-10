@@ -52,6 +52,23 @@ separately.
    function calling enabled; the proxy accepts and ignores this metadata. Tool
    execution uses the agent profile, and progress appears as inline text.
 
+For message-level session mapping, add these **Custom Headers** to the connection:
+
+```json
+{
+  "X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+  "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+  "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+  "X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+  "X-OpenWebUI-Task": "{{TASK}}"
+}
+```
+
+Keep user-info forwarding enabled for user isolation. These are the same message
+placeholders documented in the
+[Open WebUI Computer connection guide](https://docs.openwebui.com/getting-started/quick-start/connect-an-agent/cptr/).
+Clients without these message headers continue using transcript hashes.
+
 If Open WebUI runs in Docker on macOS, use
 `http://host.docker.internal:8081/v1`, and set the proxy's `server.host` to
 `0.0.0.0` so the container can reach it. On Linux, arrange host gateway networking
@@ -124,18 +141,29 @@ are not rendered. Claude text streams token by token. Codex JSON mode delivers
 assistant text at completed-message boundaries and tool status as items arrive.
 
 For ordinary streaming chat with a forwarded chat ID, each turn takes a lock scoped by user, chat, profile,
-and configuration. SQLite has one `sessions` table with `chat_id`, `session_id`,
-`cwd`, `prefix_hash`, and `updated_at`; `chat_id` stores the hash of this scope.
+and configuration. SQLite stores the latest session in `sessions` and available
+branch endpoints in `branch_sessions`, including native session IDs, working
+directories, transcript hashes, user/assistant message IDs, and parent IDs.
+`chat_id` stores the hash of this scope. Existing databases migrate automatically
+at startup; no transcript contents are stored in either table.
 
 - A new chat starts a native agent session. If it already includes history, the
   transcript is replayed as JSON text so imported chats retain context.
-- On the next turn, the hash of all messages before the final user message must
-  match the saved hash. The proxy resumes the native session and sends only the
-  new user content, including any new images.
-- Edits, regeneration, branch changes, altered system messages, and changed
-  profiles start a new session with the current transcript. This restores visible
+- With parent-ID headers, the parent selects an available branch endpoint. An
+  explicitly empty parent starts at the root; an absent parent header uses the
+  latest session. Unknown parents start fresh rather than guessing from text.
+- Before resume, the hash of all messages before the final user message must
+  match the selected endpoint's hash. Reusing its user or assistant message ID
+  also forces replay. Otherwise, the proxy resumes and sends only the new user
+  content, including any new images.
+- Edits, regeneration, unavailable branch endpoints, altered system messages,
+  and changed profiles start a new session with the current transcript. This restores visible
   conversation context, including displayed tool lines, but does not recreate
   earlier hidden agent reasoning or tool results.
+- Returning to an independent, unchanged branch endpoint can resume its native
+  session. Resuming mutates that session, so its old endpoint mappings are
+  invalidated first. The bridge does not rewind or fork a native session at an
+  arbitrary older message. Those points require a fresh transcript replay.
 - Without a chat ID, every request starts a fresh session with the flattened
   transcript and writes no mapping to SQLite.
 
@@ -146,7 +174,9 @@ or whitespace changes can trigger a fresh replay. A stable WebUI system prompt
 is carried in the initial transcript; profile instructions are appended to the
 agent system prompt.
 
-The mapping is deleted before starting the backend and saved only after a
+The latest-session mapping is deleted before starting the backend. When resuming,
+all endpoints referencing that native session are invalidated before mutation;
+independent branch sessions remain available. New mappings are saved only after a
 successful result and backend cleanup. Failures, timeout, disconnect, or a process
 crash leave no reusable mapping for a partially advanced native session. A failed
 resume returns an SSE error; retry starts fresh from the supplied transcript.
@@ -216,11 +246,11 @@ names, plan mode, and max_turns do not apply to Codex. It requires
 `allowed_tools=[]` and `permission_mode="default"`. On disconnect the proxy
 terminates its process group, then escalates to SIGKILL if needed.
 
-## Agent-driven Open WebUI Knowledge and Memory
+## Agent-driven Open WebUI Knowledge, Memory, Notes, and Chat History
 
 Both Claude and Codex can search Open WebUI directly during their turns using
 the bridge's built-in stdio MCP adapter. No separate MCP server installation or
-Open WebUI tool-server connection is needed. Only Knowledge and Memory are
+Open WebUI tool-server connection is needed. Knowledge, Memory, Notes, and chat history are
 exposed; Open WebUI's other built-in tools are not forwarded.
 
 Add shared defaults in `profiles.toml` to enable every Claude and Codex profile:
@@ -232,6 +262,9 @@ api_key_env = "OPENWEBUI_API_KEY"
 knowledge = true
 memory = true
 memory_write = false
+notes = false # Set true to enable Notes tools.
+notes_write = false
+chat_history = false # Set true for read-only access to previous conversations.
 knowledge_ids = [] # All accessible bases; set IDs to restrict access.
 timeout_seconds = 30
 
@@ -247,7 +280,7 @@ To disable inherited access for one profile, put `openwebui = false` inside its
 profiles can still configure their own complete `.openwebui` table as before.
 These defaults share one configured account's access across profiles and users;
 they do not select a different API key for each Open WebUI user. Background task
-requests still run without Knowledge or Memory tools.
+requests still run without Knowledge, Memory, Notes, or chat-history tools.
 
 Set your Open WebUI **user API key** as `OPENWEBUI_API_KEY` in `.env` or export it
 before starting the bridge, then restart it. This key is separate from `PROXY_API_KEY`. Create it
@@ -261,20 +294,118 @@ agent starts. Different profiles can name different key environment variables.
 | `knowledge = true` | List bases, search relevant passages, list source files, read extracted source text |
 | `memory = true` | List and semantically search the configured account's memories |
 | `memory_write = true` | Also allow adding, updating, and deleting individual memories |
+| `memory_path` | Optional project path for default list/search and new memories; includes descendants |
+| `memory_include_shared = true` | Include unpathed `user` memories alongside the project in list/search |
+| `notes = true` | List, text-search, and read accessible notes as Markdown |
+| `notes_write = true` | Also allow creating, updating, and deleting notes; requires `notes = true` |
+| `chat_history = true` | Search previous conversations and read their selected branches; read-only |
 | `knowledge_ids` | Optional allowlist applied to every Knowledge operation |
 
 `add_memory` accepts `content`, optional `path`, and optional `type` (`user` or
 `context`). For example, ask: “Remember that this project uses uv, under
 `projects/openwebui-bridge`, as a context memory.” Paths organize memories in
-Open WebUI; they do not access the filesystem or automatically scope access to
-the profile's working directory. The agent can use your specified path or choose
-a relevant one. Omitting type uses Open WebUI's default.
+Open WebUI; they do not access the filesystem. Omitting path uses `memory_path`
+when configured. An explicit path overrides it; `path = ""` saves without a path.
+For a shared preference, use `type = "user"` and `path = ""`.
+Omitting type uses Open WebUI's default.
 
 `update_memory` accepts the memory ID and any combination of `content`, `path`,
 and `type`. Omitted or null fields remain unchanged; an empty path (`""`) clears
 the path. Listing memories returns any path/type metadata supplied by Open WebUI.
 These fields are available to both Claude and Codex through the same adapter.
 Older Open WebUI versions may ignore path/type fields.
+
+### Project memory retrieval
+
+Set a project path in each profile's Open WebUI overrides. Profiles for Claude
+and Codex working on the same project should use the same path:
+
+```toml
+[profiles."claude-code:myrepo".openwebui]
+memory_path = "projects/myrepo"
+memory_include_shared = true
+
+[profiles."codex:myrepo".openwebui]
+memory_path = "projects/myrepo"
+memory_include_shared = true
+```
+
+These tables inherit the shared `[openwebui]` connection. You can also set
+`memory_path` there if every profile works on the same project. Paths normalize
+leading/trailing and repeated slashes; `.` and `..` segments are rejected.
+
+`list_memories` and `search_memories` default to that exact path and descendants,
+plus shared preferences (`type = "user"` with no path). Set
+`memory_include_shared = false` to omit those preferences. Both tools accept an
+explicit `path` and `include_shared` override; `path = ""` searches/lists the
+whole account. Existing profiles without `memory_path` retain account-wide retrieval.
+Existing unpathed context memories are not included in project scope; move them
+with `update_memory` or retrieve them with an explicit account-wide search.
+
+Semantic search retains Open WebUI's ranking and relevance threshold. Since its
+vector API has no path filter, the bridge requests the full account ranking,
+filters by current memory IDs and path, then applies the requested limit. This
+avoids unrelated projects crowding out matches, but increases retrieval work and
+response size for large collections. The existing 4 MiB response limit applies;
+there is no measured recall or latency improvement yet.
+
+`list_memory_paths` browses account paths and counts. `read_memory_path` reads
+the supplied path (or profile default), with optional `type`, `include_children`,
+and `limit`. Open WebUI also includes ancestor-path context in this read endpoint.
+These tools require an Open WebUI version with `/memories/paths` and
+`/memories/path` support; older versions report an API error.
+See the [Open WebUI memory API implementation](https://github.com/open-webui/open-webui/blob/main/backend/open_webui/routers/memories.py).
+
+Paths control retrieval defaults, not access permissions: the tools still use
+the configured API-key account, and explicit overrides can access its other paths.
+
+### Notes
+
+Enable `notes = true` in shared `[openwebui]` settings or a profile's `.openwebui`
+table. Notes are disabled by default. All tools use the configured API-key
+account's Notes permissions, including access to shared notes.
+
+- `list_notes(page)` returns previews, up to 60 notes per page.
+- `search_notes(query, page)` uses Open WebUI's text search; it is not semantic retrieval.
+- `read_note(note_id, offset, max_chars)` returns Markdown, with slices for long notes.
+- With `notes_write = true`: `create_note(title, content)`,
+  `update_note(note_id, title?, content?)`, and `delete_note(note_id)`.
+
+For example: “Find my deployment checklist and summarize it.” With writes enabled:
+“Save this summary as a note titled Deployment checklist.” Updates replace the
+full Markdown when content is supplied; omitted title/content stay unchanged.
+The bridge preserves sharing permissions and other document metadata. Concurrent
+edits in the browser can still race with agent edits; the API has no revision
+precondition in this integration. Notes writes are auto-approved when enabled.
+
+The read-only connectivity check also checks Notes when enabled. Your account
+must have Notes permission, and API-key endpoint restrictions must allow the
+Notes routes. Current endpoint behavior is documented by
+[Open WebUI's Notes API source](https://github.com/open-webui/open-webui/blob/main/backend/open_webui/routers/notes.py).
+
+### Chat history
+
+Enable `chat_history = true` in `[openwebui]` or a profile's `.openwebui` table
+for both Claude and Codex. It is disabled by default. This adds:
+
+- `search_chats(query, page)`: search chat titles and message content, with up to
+  60 results per page. Returns titles, IDs, and snippets.
+- `read_chat(chat_id, offset, max_chars)`: read the selected branch from oldest
+  to newest as text. Follow `next_offset` to read additional slices.
+
+For example: “Find our earlier deployment discussion and summarize the decisions.”
+The tools use the API-key account's access, not the forwarded chat user's identity.
+Searches may include the current conversation. Reads exclude alternate branches,
+raw attachment data, and tool-call payloads. The existing 4 MiB API-response limit
+also applies before slicing; chats with large attachments can exceed it.
+Standalone `tag:` filters are rejected because Open WebUI's search endpoint can
+delete unused tags for that query form. No chat editing, deletion, or admin
+export tools are exposed. The connectivity check tests chat search when enabled.
+API-key endpoint restrictions must permit `/api/v1/chats/search` and
+`/api/v1/chats/{id}`. See
+[Open WebUI's Chats API source](https://github.com/open-webui/open-webui/blob/main/backend/open_webui/routers/chats.py).
+
+### Write permissions and account access
 
 Memory writes are disabled by default. When enabled, the bridge auto-approves
 only those configured MCP tools on both backends, including Codex's explicit
@@ -285,16 +416,16 @@ Background title/tag tasks receive no MCP tools, even on an enabled profile.
 
 All calls use the profile's configured API-key owner and Open WebUI's access
 checks. Forwarded user/chat IDs do not impersonate that owner. Everyone who can
-select that bridge profile can use its configured account's Knowledge/Memory;
+select that bridge profile can use its configured account's Knowledge, Memory, Notes, and chats;
 for multiple users, assign separate profiles and keys with model access controls.
 Changing the key or integration configuration starts a separate native session.
 
-These tools use Open WebUI's Knowledge, file-text, retrieval, and Memory APIs;
+These tools use Open WebUI's Knowledge, file-text, retrieval, Memory, Notes, and Chats APIs;
 they do not call its chat-completions endpoint, so they cannot recurse into the
 bridge. Embedding-backed searches require working Open WebUI embeddings. Memory
 must be enabled and permitted for the API-key owner. If API-key endpoint
 restrictions are enabled, allow the relevant `/api/v1/knowledge/`,
-`/api/v1/retrieval/query/collection`, `/api/v1/files/`, and `/api/v1/memories/`
+`/api/v1/retrieval/query/collection`, `/api/v1/files/`, `/api/v1/memories/`, and `/api/v1/notes/`
 routes according to your version's restriction rules. HTTP failures return a
 sanitized tool error without upstream bodies or credentials. Responses above
 4 MiB are rejected. Native Open WebUI Knowledge bases are supported; external

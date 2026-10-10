@@ -5,9 +5,18 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
+
+
+def normalize_memory_path(value: str) -> str:
+    value = "/".join(part for part in value.strip().split("/") if part)
+    if len(value) > 1000 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("Invalid memory path")
+    if any(part in {".", ".."} for part in value.split("/")):
+        raise ValueError("Memory paths cannot contain . or .. segments")
+    return value
 
 
 class OpenWebUIConfig(BaseModel):
@@ -17,8 +26,20 @@ class OpenWebUIConfig(BaseModel):
     knowledge: bool = True
     memory: bool = True
     memory_write: bool = False
+    memory_path: str | None = None
+    memory_include_shared: bool = True
+    notes: bool = False
+    notes_write: bool = False
+    chat_history: bool = False
     knowledge_ids: list[str] = Field(default_factory=list)
     timeout_seconds: float = Field(default=30, gt=0, le=120)
+
+    @field_validator("memory_path")
+    @classmethod
+    def valid_memory_path(cls, value):
+        if value is None:
+            return None
+        return normalize_memory_path(value) or None
 
     @model_validator(mode="after")
     def valid_connection(self):
@@ -36,6 +57,8 @@ class OpenWebUIConfig(BaseModel):
             )
         if self.memory_write and not self.memory:
             raise ValueError("memory_write requires memory = true")
+        if self.notes_write and not self.notes:
+            raise ValueError("notes_write requires notes = true")
         return self
 
     def tool_names(self) -> list[str]:
@@ -48,9 +71,15 @@ class OpenWebUIConfig(BaseModel):
                 "read_knowledge_file",
             ]
         if self.memory:
-            tools += ["list_memories", "search_memories"]
+            tools += ["list_memories", "search_memories", "list_memory_paths", "read_memory_path"]
             if self.memory_write:
                 tools += ["add_memory", "update_memory", "delete_memory"]
+        if self.notes:
+            tools += ["list_notes", "search_notes", "read_note"]
+            if self.notes_write:
+                tools += ["create_note", "update_note", "delete_note"]
+        if self.chat_history:
+            tools += ["search_chats", "read_chat"]
         return tools
 
 

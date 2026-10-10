@@ -206,6 +206,9 @@ def codex_command(
         if profile.openwebui.memory_write:
             for tool in ("add_memory", "update_memory", "delete_memory"):
                 command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
+        if profile.openwebui.notes_write:
+            for tool in ("create_note", "update_note", "delete_note"):
+                command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
         system_prompt += "\n\n" + INSTRUCTIONS
     if system_prompt:
         command += ["-c", "developer_instructions=" + json.dumps(system_prompt)]

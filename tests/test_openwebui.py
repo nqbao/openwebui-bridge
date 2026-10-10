@@ -309,12 +309,14 @@ url = "http://localhost:3000"
 api_key_env = "TEST_WEBUI_KEY"
 knowledge_ids = ["kb"]
 memory_write = true
+memory_path = "projects/test"
 """)
     profile = load_settings(path).profiles["codex:test"]
     monkeypatch.setenv("TEST_WEBUI_KEY", "private-key")
     environment = connection_env(profile.openwebui)
     assert environment[TOKEN_ENV] == "private-key"
     assert json.loads(environment[CONFIG_ENV])["memory_write"] is True
+    assert json.loads(environment[CONFIG_ENV])["memory_path"] == "projects/test"
     command = codex_command(profile, "session")
     mcp = next(value for value in command if value.startswith("mcp_servers.openwebui="))
     config = tomllib.loads(mcp)["mcp_servers"]["openwebui"]
@@ -335,14 +337,22 @@ memory_write = true
 
 
 @pytest.mark.parametrize("resume", [None, "session"])
-async def test_claude_mcp_tools_and_permission_hook(tmp_path, monkeypatch, resume):
+@pytest.mark.parametrize("notes_write", [False, True])
+async def test_claude_mcp_tools_and_permission_hook(tmp_path, monkeypatch, resume, notes_write):
     monkeypatch.setenv("OPENWEBUI_API_KEY", "private-key")
     client = mock_client(monkeypatch, [result()])
-    profile = Profile(cwd=tmp_path, allowed_tools=[], openwebui=OpenWebUIConfig(url="http://webui"))
+    profile = Profile(
+        cwd=tmp_path,
+        allowed_tools=[],
+        openwebui=OpenWebUIConfig(
+            url="http://webui", notes=True, notes_write=notes_write, memory_path="projects/test"
+        ),
+    )
     _ = [event async for event in ClaudeBackend().stream(profile, "question", resume)]
     options = client.options
     assert options.resume == resume
     assert options.env[TOKEN_ENV] == "private-key"
+    assert json.loads(options.env[CONFIG_ENV])["memory_path"] == "projects/test"
     assert "private-key" not in json.dumps(options.mcp_servers)
     assert options.mcp_servers["openwebui"]["args"] == server_command()["args"]
     assert options.allowed_tools == [
@@ -350,6 +360,13 @@ async def test_claude_mcp_tools_and_permission_hook(tmp_path, monkeypatch, resum
     ]
     hook = options.hooks["PreToolUse"][0].hooks[0]
     assert await hook({"tool_name": "mcp__openwebui__search_knowledge"}, None, None) == {}
+    assert await hook({"tool_name": "mcp__openwebui__read_note"}, None, None) == {}
+    assert await hook({"tool_name": "mcp__openwebui__read_memory_path"}, None, None) == {}
+    decision = await hook({"tool_name": "mcp__openwebui__create_note"}, None, None)
+    if notes_write:
+        assert decision == {}
+    else:
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
     for name in ["mcp__openwebui__delete_memory", "mcp__other__search_knowledge", "Bash"]:
         assert (await hook({"tool_name": name}, None, None))["hookSpecificOutput"][
             "permissionDecision"
@@ -357,7 +374,9 @@ async def test_claude_mcp_tools_and_permission_hook(tmp_path, monkeypatch, resum
 
 
 async def test_real_stdio_mcp_discovery():
-    config = OpenWebUIConfig(url="http://127.0.0.1:9", memory=False)
+    config = OpenWebUIConfig(
+        url="http://127.0.0.1:9", memory=False, notes=True, notes_write=True, chat_history=True
+    )
     params = StdioServerParameters(
         **server_command(),
         env={**os.environ, CONFIG_ENV: config.model_dump_json(), TOKEN_ENV: "test-key"},

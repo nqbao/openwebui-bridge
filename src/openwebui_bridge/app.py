@@ -160,6 +160,20 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             if chat_id and not isolated
             else None
         )
+        message_ids = {}
+        if key:
+            for name, header in (
+                ("user_message_id", "x-openwebui-user-message-id"),
+                ("assistant_message_id", "x-openwebui-message-id"),
+                ("parent_message_id", "x-openwebui-user-message-parent-id"),
+            ):
+                value = request.headers.get(header)
+                if value is not None:
+                    value = value.strip()
+                    if len(value) > 200 or any(ord(char) < 32 for char in value):
+                        raise HTTPException(400, "Invalid message-ID header")
+                    message_ids[name] = value or None
+            message_ids["parent_known"] = "x-openwebui-user-message-parent-id" in request.headers
         response_id = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
 
@@ -257,17 +271,32 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         async def run_turn():
             store = request.app.state.store
             row = store.get(key) if key else None
+            if key and message_ids.get("parent_known"):
+                parent = message_ids.get("parent_message_id")
+                # Explicit empty parent means root, while absent means legacy
+                # clients can continue using the last-session/hash behavior.
+                row = store.get_branch(key, parent) if parent else None
             resume = None
             if (
                 row
                 and row["cwd"] == str(profile.cwd)
                 and row["prefix_hash"] == digest(messages[:-1])
+                and not (
+                    message_ids.get("user_message_id")
+                    and message_ids["user_message_id"] == row["user_message_id"]
+                )
+                and not (
+                    message_ids.get("assistant_message_id")
+                    and message_ids["assistant_message_id"] == row["assistant_message_id"]
+                )
             ):
                 resume = row["session_id"]
             prompt = messages[-1]["content"] if resume else replay(messages)
             if key:
-                # A resumed agent session mutates before the result arrives. Remove
-                # the row now so crash/cancellation/failure forces a fresh replay.
+                if resume:
+                    store.invalidate_session(key, resume)
+                # Clear the last-turn pointer, preserving independent native
+                # sessions on other branches when this turn starts fresh.
                 store.delete(key)
             queue: asyncio.Queue = asyncio.Queue(maxsize=64)
 
@@ -315,7 +344,9 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                     raise RuntimeError("Backend did not return a session")
                 if key:
                     prefix = messages + [{"role": "assistant", "content": "".join(rendered)}]
-                    store.save(key, result.session_id, str(profile.cwd), digest(prefix))
+                    store.save(
+                        key, result.session_id, str(profile.cwd), digest(prefix), **message_ids
+                    )
                 yield chunk({}, finish="stop")
                 if (
                     body.stream_options
