@@ -7,9 +7,9 @@ from pathlib import Path
 
 import httpx
 
-from openwebui_cli_proxy.app import create_app
-from openwebui_cli_proxy.backends import ClaudeBackend
-from openwebui_cli_proxy.config import Profile, Settings
+from openwebui_bridge.app import create_app
+from openwebui_bridge.backends import ClaudeBackend
+from openwebui_bridge.config import Profile, Settings
 
 
 async def main():
@@ -22,7 +22,7 @@ async def main():
             async for event in super().stream(profile, prompt, resume):
                 yield event
 
-    with tempfile.TemporaryDirectory(prefix="cli-proxy-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="openwebui-bridge-smoke-") as directory:
         root = Path(directory)
         backend = RecordingClaude()
         settings = Settings(

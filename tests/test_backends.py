@@ -1,14 +1,16 @@
 import asyncio
+import base64
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from claude_agent_sdk.types import StreamEvent
 
-from openwebui_cli_proxy.backends import ClaudeBackend, CodexBackend, Done, Text, codex_command
-from openwebui_cli_proxy.config import Profile
-from openwebui_cli_proxy.protocol import tool_line
+from openwebui_bridge.backends import ClaudeBackend, CodexBackend, Done, Text, codex_command
+from openwebui_bridge.config import Profile
+from openwebui_bridge.protocol import tool_line
 
 
 def event(kind, **fields):
@@ -35,7 +37,7 @@ def mock_client(monkeypatch, messages):
             Client.closed = True
 
         async def query(self, prompt):
-            Client.prompt = prompt
+            Client.prompt = prompt if isinstance(prompt, str) else [item async for item in prompt]
 
         async def receive_response(self):
             for message in messages:
@@ -119,6 +121,21 @@ async def test_claude_filters_subagent_output(tmp_path, monkeypatch):
     ]
 
 
+async def test_claude_sends_images_as_structured_user_input(tmp_path, monkeypatch):
+    client = mock_client(monkeypatch, [result()])
+    blocks = [
+        {"type": "text", "text": "Describe this screenshot"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "image"}},
+    ]
+    assert [e async for e in ClaudeBackend().stream(Profile(cwd=tmp_path), blocks, "old")] == [
+        Done("session")
+    ]
+    assert client.prompt == [
+        {"type": "user", "message": {"role": "user", "content": blocks}, "parent_tool_use_id": None}
+    ]
+    assert client.options.resume == "old"
+
+
 async def test_claude_task_profile_disables_tools_and_coding_system_prompt(tmp_path, monkeypatch):
     client = mock_client(monkeypatch, [AssistantMessage([TextBlock("Title")], "model"), result()])
     profile = Profile(cwd=tmp_path, allowed_tools=[], system_prompt="Standalone task", max_turns=2)
@@ -158,6 +175,72 @@ def test_codex_resume_flags_precede_subcommand(tmp_path):
     assert "--ignore-user-config" in command
 
 
+@pytest.mark.parametrize("resume", [None, "session"])
+def test_codex_image_flags_for_new_and_resumed_turns(tmp_path, resume):
+    profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
+    command = codex_command(profile, resume, ["/tmp/one.png", "/tmp/two.jpeg"])
+    assert command[-4:] == ["--image=/tmp/one.png", "--image=/tmp/two.jpeg", "--", "-"]
+    if resume:
+        assert command.index("resume") < command.index("--image=/tmp/one.png")
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "spawn_failure"])
+async def test_codex_image_files_private_and_cleaned(tmp_path, monkeypatch, outcome):
+    script = tmp_path / "images.py"
+    script.write_text("""import json, pathlib, sys, time
+for image in sys.argv[1:]:
+    assert pathlib.Path(image).read_bytes() == b"image fixture"
+prompt = sys.stdin.read()
+assert "[Attached image 1]" in prompt and "[Attached image 2]" in prompt
+assert "aW1hZ2UgZml4dHVyZQ==" not in prompt
+print(json.dumps({"type":"thread.started", "thread_id":"native"}), flush=True)
+print(json.dumps({"type":"item.completed", "item":{"type":"agent_message", "text":"seen"}}), flush=True)
+if "cancel" in prompt:
+    time.sleep(60)
+elif "failure" in prompt:
+    print(json.dumps({"type":"turn.failed"}), flush=True)
+else:
+    print(json.dumps({"type":"turn.completed"}), flush=True)
+""")
+    paths = []
+
+    def command(_profile, _resume, images):
+        paths.extend(Path(image) for image in images)
+        assert len(images) == 2
+        assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
+        assert paths[0].parent.stat().st_mode & 0o777 == 0o700
+        assert paths[0].parent != tmp_path
+        if outcome == "spawn_failure":
+            return [str(tmp_path / "missing-executable")]
+        return [sys.executable, str(script), *images]
+
+    monkeypatch.setattr("openwebui_bridge.backends.codex_command", command)
+    block = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(b"image fixture").decode(),
+        },
+    }
+    profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
+    stream = CodexBackend().stream(profile, [{"type": "text", "text": outcome}, block, block], None)
+    if outcome == "spawn_failure":
+        with pytest.raises(FileNotFoundError):
+            await anext(stream)
+    else:
+        assert await anext(stream) == Text("seen")
+        assert all(path.exists() for path in paths)
+        if outcome == "cancel":
+            await asyncio.wait_for(stream.aclose(), 3)
+        elif outcome == "failure":
+            with pytest.raises(RuntimeError):
+                await anext(stream)
+        else:
+            assert [event async for event in stream] == [Done("native")]
+    assert paths and all(not path.parent.exists() for path in paths)
+
+
 async def test_codex_real_subprocess_jsonl_adapter(tmp_path, monkeypatch):
     script = tmp_path / "fake_codex.py"
     script.write_text("""import json, sys
@@ -173,7 +256,7 @@ for event in [
     print(json.dumps(event), flush=True)
 """)
     monkeypatch.setattr(
-        "openwebui_cli_proxy.backends.codex_command", lambda *_args: [sys.executable, str(script)]
+        "openwebui_bridge.backends.codex_command", lambda *_args: [sys.executable, str(script)]
     )
     profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
     events = [e async for e in CodexBackend().stream(profile, "hello", None)]
@@ -195,7 +278,7 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
 time.sleep(60)
 """)
     monkeypatch.setattr(
-        "openwebui_cli_proxy.backends.codex_command", lambda *_args: [sys.executable, str(script)]
+        "openwebui_bridge.backends.codex_command", lambda *_args: [sys.executable, str(script)]
     )
     profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
     stream = CodexBackend().stream(profile, "hello", None)
@@ -209,7 +292,7 @@ time.sleep(60)
 async def test_codex_failure_no_success_result(tmp_path, monkeypatch):
     code = "import json; print(json.dumps({'type': 'turn.failed'}), flush=True)"
     monkeypatch.setattr(
-        "openwebui_cli_proxy.backends.codex_command", lambda *_args: [sys.executable, "-c", code]
+        "openwebui_bridge.backends.codex_command", lambda *_args: [sys.executable, "-c", code]
     )
     profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
     with pytest.raises(RuntimeError):

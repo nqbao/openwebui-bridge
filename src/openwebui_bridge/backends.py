@@ -1,12 +1,17 @@
 import asyncio
+import base64
 import json
 import os
 import signal
+import tempfile
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Profile
-from .protocol import tool_line
+from .openwebui_mcp import CONFIG_ENV, INSTRUCTIONS, TOKEN_ENV, connection_env, server_command
+from .protocol import Prompt, tool_line
 
 
 @dataclass(frozen=True)
@@ -21,7 +26,7 @@ class Done:
 
 
 class ClaudeBackend:
-    async def stream(self, profile: Profile, prompt: str, resume: str | None) -> AsyncIterator:
+    async def stream(self, profile: Profile, prompt: Prompt, resume: str | None) -> AsyncIterator:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
@@ -34,11 +39,21 @@ class ClaudeBackend:
         )
         from claude_agent_sdk.types import StreamEvent
 
+        integration = profile.openwebui
+        mcp_tools = (
+            [f"mcp__openwebui__{name}" for name in integration.tool_names()] if integration else []
+        )
+        allowed_tools = profile.allowed_tools + mcp_tools
+        environment = connection_env(integration)
+        system_prompt = profile.system_prompt
+        if mcp_tools:
+            system_prompt += "\n\n" + INSTRUCTIONS
+
         async def deny_approval(_name, _inputs, _context):
             return PermissionResultDeny(message="This proxy has no interactive approval UI")
 
         async def restrict_tools(data, _tool_use_id, _context):
-            if data.get("tool_name") not in profile.allowed_tools:
+            if data.get("tool_name") not in allowed_tools:
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -52,15 +67,17 @@ class ClaudeBackend:
             cwd=str(profile.cwd),
             model=profile.model,
             tools=profile.allowed_tools,
-            allowed_tools=profile.allowed_tools,
+            allowed_tools=allowed_tools,
             permission_mode=profile.permission_mode,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": profile.system_prompt,
+                "append": system_prompt,
             }
             if profile.allowed_tools
-            else profile.system_prompt,
+            else system_prompt,
+            mcp_servers={"openwebui": {"type": "stdio", **server_command()}} if mcp_tools else {},
+            env=environment,
             setting_sources=[],
             # Ignore MCP servers from host/project config, including on resume.
             strict_mcp_config=True,
@@ -78,7 +95,18 @@ class ClaudeBackend:
         # The caller runs this entire iterator in one producer task: SDK cancel
         # scopes must be entered/exited in the same task, even on HTTP disconnect.
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
+            if isinstance(prompt, str):
+                await client.query(prompt)
+            else:
+
+                async def user_input():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": prompt},
+                        "parent_tool_use_id": None,
+                    }
+
+                await client.query(user_input())
             async for message in client.receive_response():
                 if isinstance(message, StreamEvent):
                     if message.parent_tool_use_id:
@@ -135,7 +163,9 @@ class ClaudeBackend:
         yield result
 
 
-def codex_command(profile: Profile, resume: str | None) -> list[str]:
+def codex_command(
+    profile: Profile, resume: str | None, images: list[str] | None = None
+) -> list[str]:
     # Put parent exec flags before resume: the resume subcommand has fewer flags.
     command = [
         "codex",
@@ -153,23 +183,79 @@ def codex_command(profile: Profile, resume: str | None) -> list[str]:
     ]
     if profile.model:
         command += ["--model", profile.model]
-    if profile.system_prompt:
-        command += ["-c", "developer_instructions=" + json.dumps(profile.system_prompt)]
+    system_prompt = profile.system_prompt
+    if profile.openwebui and profile.openwebui.tool_names():
+        config = {
+            **server_command(),
+            "env_vars": [CONFIG_ENV, TOKEN_ENV],
+            "enabled_tools": profile.openwebui.tool_names(),
+            "required": True,
+            "startup_timeout_sec": 20,
+            "tool_timeout_sec": profile.openwebui.timeout_seconds + 10,
+        }
+        # JSON string quoting is TOML-compatible; values contain no credentials.
+        table = (
+            "{"
+            + ", ".join(
+                f"{key} = {str(value).lower() if isinstance(value, bool) else json.dumps(value)}"
+                for key, value in config.items()
+            )
+            + "}"
+        )
+        command += ["-c", "mcp_servers.openwebui=" + table]
+        if profile.openwebui.memory_write:
+            for tool in ("add_memory", "update_memory", "delete_memory"):
+                command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
+        system_prompt += "\n\n" + INSTRUCTIONS
+    if system_prompt:
+        command += ["-c", "developer_instructions=" + json.dumps(system_prompt)]
     if resume:
         command += ["resume", resume]
+    if images:
+        # Image flags belong to the resume subcommand on continued turns. The
+        # separator prevents exec's variadic image option consuming stdin '-'.
+        command += [f"--image={path}" for path in images]
+        return command + ["--", "-"]
     return command + ["-"]
 
 
 class CodexBackend:
-    async def stream(self, profile: Profile, prompt: str, resume: str | None) -> AsyncIterator:
+    async def stream(self, profile: Profile, prompt: Prompt, resume: str | None) -> AsyncIterator:
+        # Keep attachments outside the repository, private to this invocation.
+        # The directory outlives the subprocess and is removed on all outcomes.
+        with tempfile.TemporaryDirectory(prefix="openwebui-bridge-images-") as directory:
+            images = []
+            if isinstance(prompt, list):
+                text = []
+                for block in prompt:
+                    if block["type"] == "text":
+                        text.append(block["text"])
+                    elif block["type"] == "image":
+                        source = block["source"]
+                        extension = source["media_type"].split("/", 1)[1]
+                        path = Path(directory) / f"image-{len(images) + 1}.{extension}"
+                        with path.open("xb") as file:
+                            os.chmod(path, 0o600)
+                            file.write(base64.b64decode(source["data"], validate=True))
+                        images.append(str(path))
+                        text.append(f"[Attached image {len(images)}]")
+                prompt = "\n\n".join(text)
+            async with aclosing(self._stream(profile, prompt, resume, images)) as events:
+                async for event in events:
+                    yield event
+
+    async def _stream(
+        self, profile: Profile, prompt: str, resume: str | None, images: list[str]
+    ) -> AsyncIterator:
         process = await asyncio.create_subprocess_exec(
-            *codex_command(profile, resume),
+            *codex_command(profile, resume, images),
             cwd=profile.cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=4 * 1024 * 1024,
+            env={**os.environ, **connection_env(profile.openwebui)},
         )
 
         async def write_prompt():

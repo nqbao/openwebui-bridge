@@ -1,15 +1,16 @@
 import asyncio
+import base64
 import json
 from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 
-from openwebui_cli_proxy.app import create_app
-from openwebui_cli_proxy.backends import Done, Text
-from openwebui_cli_proxy.config import Profile, Settings, load_settings
-from openwebui_cli_proxy.protocol import tool_line
-from openwebui_cli_proxy.store import Store
+from openwebui_bridge.app import create_app
+from openwebui_bridge.backends import Done, Text
+from openwebui_bridge.config import Profile, Settings, load_settings
+from openwebui_bridge.protocol import tool_line
+from openwebui_bridge.store import Store
 
 
 class FakeBackend:
@@ -53,6 +54,121 @@ async def client_for(tmp_path, backend=None, **kwargs):
 
 def msg(role, content):
     return {"role": role, "content": content}
+
+
+def image_part(data=b"\x89PNG\r\n\x1a\nfixture", kind="png"):
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:image/{kind};base64," + base64.b64encode(data).decode(),
+            "detail": "high",
+        },
+    }
+
+
+async def test_image_input_resume_and_edit_replay(tmp_path):
+    image = image_part()
+    content = [{"type": "text", "text": "Describe this"}, image]
+    async with client_for(tmp_path) as (client, backend, _):
+        history = [msg("user", content)]
+        response = await complete(client, history)
+        assert response.status_code == 200
+        prompt = backend.calls[-1][1]
+        assert prompt[0] == {"type": "text", "text": "Describe this"}
+        assert prompt[1]["type"] == "image"
+        assert prompt[1]["source"]["data"] == image["image_url"]["url"].split(",")[1]
+        history += [msg("assistant", "answer"), msg("user", "More details")]
+        await complete(client, history)
+        assert backend.calls[-1][1:] == ("More details", "session-1")
+        history[0]["content"][1] = image_part(b"\x89PNG\r\n\x1a\nchanged")
+        await complete(client, history)
+        assert backend.calls[-1][2] is None
+        replayed = backend.calls[-1][1]
+        images = [block for block in replayed if block["type"] == "image"]
+        assert len(images) == 1
+        assert images[0]["source"]["data"] == base64.b64encode(b"\x89PNG\r\n\x1a\nchanged").decode()
+        assert "More details" in replayed[-1]["text"]
+        assert images[0]["source"]["data"] not in "".join(
+            block.get("text", "") for block in replayed
+        )
+
+
+async def test_latest_image_on_resumed_turn_and_nonstreaming_task(tmp_path):
+    async with client_for(tmp_path) as (client, backend, _):
+        await complete(client, [msg("user", "first")])
+        messages = [msg("user", "first"), msg("assistant", "answer"), msg("user", [image_part()])]
+        await complete(client, messages)
+        assert backend.calls[-1][2] == "session-1"
+        assert backend.calls[-1][1][0]["type"] == "image"
+        response = await complete(client, messages, stream=False)
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "answer"
+        assert backend.calls[-1][2] is None
+        assert any(block["type"] == "image" for block in backend.calls[-1][1])
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,!!!!"}},
+        image_part(b"not an image"),
+        image_part(kind="svg+xml"),
+        image_part(b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024)),
+    ],
+)
+async def test_invalid_images_fail_before_backend(tmp_path, part):
+    async with client_for(tmp_path) as (client, backend, _):
+        response = await complete(client, [msg("user", [part])])
+        assert response.status_code == 400
+        assert backend.calls == []
+        assert part["image_url"]["url"] not in response.text
+
+
+@pytest.mark.parametrize("role", ["system", "assistant", "developer"])
+async def test_images_only_in_user_messages(tmp_path, role):
+    async with client_for(tmp_path) as (client, backend, _):
+        response = await complete(client, [msg(role, [image_part()]), msg("user", "hi")])
+        assert response.status_code == 400
+        assert backend.calls == []
+
+
+@pytest.mark.parametrize("count,size", [(21, 10), (5, 5 * 1024 * 1024 - 8)])
+async def test_image_request_limits(tmp_path, count, size):
+    async with client_for(tmp_path) as (client, backend, _):
+        response = await complete(
+            client, [msg("user", [image_part(b"\x89PNG\r\n\x1a\n" + b"x" * size)] * count)]
+        )
+        assert response.status_code == 400
+        assert backend.calls == []
+
+
+async def test_codex_images_resume_and_replay(tmp_path):
+    backend = FakeBackend()
+    settings = Settings(
+        profiles={"codex:test": Profile(cwd=tmp_path, backend="codex", allowed_tools=[])},
+        database=tmp_path / "sessions.db",
+    )
+    app = create_app(settings, {"codex": backend})
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        response = await complete(client, [msg("user", [image_part()])], model="codex:test")
+        assert response.status_code == 200
+        assert backend.calls[-1][1][0]["type"] == "image"
+        history = [
+            msg("user", [image_part()]),
+            msg("assistant", "answer"),
+            msg("user", [{"type": "text", "text": "Compare"}, image_part()]),
+        ]
+        await complete(client, history, model="codex:test")
+        assert backend.calls[-1][2] == "session-1"
+        assert len(backend.calls[-1][1]) == 2
+        history[0]["content"] = [image_part(b"\x89PNG\r\n\x1a\nchanged")]
+        await complete(client, history, model="codex:test")
+        assert backend.calls[-1][2] is None
+        assert sum(block["type"] == "image" for block in backend.calls[-1][1]) == 2
 
 
 async def complete(

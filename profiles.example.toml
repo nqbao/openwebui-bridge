@@ -8,6 +8,17 @@ turn_timeout_seconds = 600
 task_model = "haiku" # Isolated Claude SDK calls with tools disabled.
 task_timeout_seconds = 60
 
+# Optional defaults for every Claude and Codex profile. Uncomment to enable.
+# Set OPENWEBUI_API_KEY in .env or the environment. No secret belongs in TOML.
+# [openwebui]
+# url = "http://127.0.0.1:3000" # Host-reachable base URL, without /api or /v1.
+# api_key_env = "OPENWEBUI_API_KEY"
+# knowledge = true
+# memory = true
+# memory_write = false # True allows add/update/delete without an approval UI.
+# knowledge_ids = [] # All bases accessible to the configured account.
+# timeout_seconds = 30
+
 [profiles."claude-code:myrepo"]
 backend = "claude"
 cwd = "."
@@ -17,20 +28,32 @@ allowed_tools = ["Read", "Glob", "Grep"]
 system_prompt = "Help the user understand this repository. You have read-only tools."
 max_turns = 30
 
+# Optional profile overrides. Other settings inherit from [openwebui].
+# Without shared defaults, include url here to enable just this profile.
+# [profiles."claude-code:myrepo".openwebui]
+# url = "http://127.0.0.1:3000"
+# api_key_env = "OPENWEBUI_API_KEY"
+# knowledge = true
+# memory = true
+# memory_write = false # Set true to allow add/update/delete without an approval UI.
+# knowledge_ids = [] # Empty means all bases accessible to the configured user.
+# timeout_seconds = 30
+
 [profiles."codex:myrepo"]
 backend = "codex"
 cwd = "."
-#model = "sonnet"
 permission_mode = "default"
 allowed_tools = []
-#allowed_tools = ["Read", "Glob", "Grep"]
-#system_prompt = "Help the user understand this repository. You have read-only tools."
 max_turns = 30
 
-# Enable after installing/authenticating the Codex CLI on the host.
-# [profiles."codex:myrepo"]
-# backend = "codex"
-# cwd = "."
-# permission_mode = "default"
-# allowed_tools = [] # Codex uses its read-only OS sandbox, not Claude tool names.
-
+# To disable inherited integration, add openwebui = false inside the profile
+# table above (before any nested table).
+# Same overrides work for Codex; each profile can use its own key and allowlist.
+# [profiles."codex:myrepo".openwebui]
+# url = "http://127.0.0.1:3000"
+# api_key_env = "OPENWEBUI_API_KEY"
+# knowledge = true
+# memory = true
+# memory_write = false
+# knowledge_ids = []
+# timeout_seconds = 30

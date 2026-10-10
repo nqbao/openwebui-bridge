@@ -2,10 +2,56 @@ import os
 import tomllib
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
+
+
+class OpenWebUIConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    url: str
+    api_key_env: str = Field(default="OPENWEBUI_API_KEY", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    knowledge: bool = True
+    memory: bool = True
+    memory_write: bool = False
+    knowledge_ids: list[str] = Field(default_factory=list)
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
+
+    @model_validator(mode="after")
+    def valid_connection(self):
+        url = urlsplit(self.url)
+        if (
+            url.scheme not in {"http", "https"}
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError(
+                "Open WebUI URL must be an HTTP(S) base URL without credentials, query, or fragment"
+            )
+        if self.memory_write and not self.memory:
+            raise ValueError("memory_write requires memory = true")
+        return self
+
+    def tool_names(self) -> list[str]:
+        tools = []
+        if self.knowledge:
+            tools += [
+                "list_knowledge",
+                "search_knowledge",
+                "list_knowledge_files",
+                "read_knowledge_file",
+            ]
+        if self.memory:
+            tools += ["list_memories", "search_memories"]
+            if self.memory_write:
+                tools += ["add_memory", "update_memory", "delete_memory"]
+        return tools
 
 
 class Profile(BaseModel):
@@ -17,6 +63,7 @@ class Profile(BaseModel):
     allowed_tools: list[str] = Field(default_factory=lambda: sorted(READ_TOOLS))
     system_prompt: str = ""
     max_turns: int = Field(default=30, ge=1)
+    openwebui: OpenWebUIConfig | None = None
 
     @model_validator(mode="after")
     def read_only(self):
@@ -49,7 +96,8 @@ def load_settings(path: Path) -> Settings:
     path = path.expanduser().resolve()
     with path.open("rb") as file:
         raw = tomllib.load(file)
-    unexpected = set(raw) - {"server", "profiles"}
+    load_dotenv(path.parent / ".env", override=False)
+    unexpected = set(raw) - {"server", "profiles", "openwebui"}
     if unexpected:
         raise ValueError(f"Unknown configuration sections: {sorted(unexpected)}")
     server = raw.get("server", {}).copy()
@@ -59,6 +107,16 @@ def load_settings(path: Path) -> Settings:
     profiles = raw.get("profiles", {})
     if not profiles:
         raise ValueError("Configure at least one profile")
+    shared_openwebui = raw.get("openwebui")
+    if shared_openwebui is not None:
+        shared_openwebui = OpenWebUIConfig.model_validate(shared_openwebui).model_dump()
     for profile in profiles.values():
         profile["cwd"] = (path.parent / Path(profile["cwd"]).expanduser()).resolve()
+        overrides = profile.get("openwebui")
+        if overrides is False:
+            profile["openwebui"] = None
+        elif shared_openwebui is not None:
+            if overrides is not None and not isinstance(overrides, dict):
+                raise ValueError("Profile openwebui must be a table or false")
+            profile["openwebui"] = {**shared_openwebui, **(overrides or {})}
     return Settings(profiles=profiles, **server)

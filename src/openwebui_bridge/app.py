@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .backends import ClaudeBackend, CodexBackend, Done, Text
 from .config import Profile, Settings
+from .openwebui_mcp import connection_env
 from .protocol import CompletionRequest, digest, replay
 from .store import ChatLocks, Store
 
@@ -70,7 +71,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         finally:
             app.state.store.close()
 
-    app = FastAPI(title="Open WebUI CLI Proxy", lifespan=lifespan)
+    app = FastAPI(title="Open WebUI Bridge", lifespan=lifespan)
 
     @app.exception_handler(HTTPException)
     async def http_error(_request, exc):
@@ -109,7 +110,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         return {
             "object": "list",
             "data": [
-                {"id": name, "object": "model", "created": 0, "owned_by": "cli-proxy"}
+                {"id": name, "object": "model", "created": 0, "owned_by": "openwebui-bridge"}
                 for name in settings.profiles
             ],
         }
@@ -137,11 +138,25 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             timeout = settings.task_timeout_seconds
             logger.info("Isolated completion: stream=%s; task=%s", body.stream, task_label(request))
         messages = [message.canonical() for message in body.messages]
+        try:
+            # Changing the configured API identity must not reuse another user's
+            # native session. Store only a digest, never the API key itself.
+            integration_identity = digest(connection_env(profile.openwebui))
+        except ValueError as exc:
+            raise HTTPException(503, str(exc)) from None
         chat_id = request.headers.get("x-openwebui-chat-id")
         user_id = request.headers.get("x-openwebui-user-id", "local")
         # Include all configuration: changed tools/model/system prompt start fresh.
         key = (
-            digest([user_id, chat_id, body.model, profile.model_dump(mode="json")])
+            digest(
+                [
+                    user_id,
+                    chat_id,
+                    body.model,
+                    profile.model_dump(mode="json"),
+                    integration_identity,
+                ]
+            )
             if chat_id and not isolated
             else None
         )
@@ -188,7 +203,13 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 return response
 
             async def wait_for_disconnect():
-                while not await request.is_disconnected():
+                while True:
+                    disconnected = await request.is_disconnected()
+                    # Starlette probes receive inside its own cancelled scope,
+                    # which can swallow an overlapping task.cancel(). Do not
+                    # leave this watcher running when a fast collector finishes.
+                    if disconnected or asyncio.current_task().cancelling():
+                        return
                     await asyncio.sleep(0.1)
 
             # Keep SDK entry, iteration and cleanup in the same producer task.
