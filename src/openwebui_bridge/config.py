@@ -1,5 +1,7 @@
 import os
+import re
 import tomllib
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -10,6 +12,44 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
 
 
+def mcp_server(pattern: str) -> str | None:
+    """Server part of an `mcp__server[__tool]` pattern; `*` only as a trailing glob."""
+    if not pattern.startswith("mcp__"):
+        return None
+    part = pattern[5:].split("__")[0].rstrip("*")
+    return part if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", part) else None
+
+
+def split_mcp_pattern(pattern: str) -> tuple[str, str | None]:
+    """(server, tool) for Codex, which enables whole servers or exact tool names."""
+    server = mcp_server(pattern)
+    if server is None:
+        raise ValueError(f"Invalid MCP tool pattern: {pattern}")
+    rest = pattern[5 + len(server) :]
+    if rest in ("", "*", "__*", "__"):
+        return server, None
+    tool = rest.removeprefix("__")
+    if rest.startswith("__") and "*" not in tool:
+        return server, tool
+    raise ValueError(f"Codex supports only mcp__server, mcp__server__*, or exact tools: {pattern}")
+
+
+def load_project_mcp(cwd: Path) -> dict[str, dict]:
+    """MCP servers declared in the folder's .codex/config.toml (Codex project config)."""
+    path = cwd / ".codex" / "config.toml"
+    if not path.is_file():
+        return {}
+    with path.open("rb") as file:
+        return tomllib.load(file).get("mcp_servers", {})
+
+
+def mcp_matches(pattern: str, name: str) -> bool:
+    """`mcp__server` allows the whole server; `*` globs match any characters."""
+    if "*" in pattern:
+        return fnmatchcase(name, pattern)
+    return name == pattern or name.startswith(pattern + "__")
+
+
 def normalize_memory_path(value: str) -> str:
     value = "/".join(part for part in value.strip().split("/") if part)
     if len(value) > 1000 or any(ord(char) < 32 or ord(char) == 127 for char in value):
@@ -17,6 +57,30 @@ def normalize_memory_path(value: str) -> str:
     if any(part in {".", ".."} for part in value.split("/")):
         raise ValueError("Memory paths cannot contain . or .. segments")
     return value
+
+
+class RemoteMCPConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    url: str
+    api_key_env: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
+    prefix: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{0,32}$")
+
+    @model_validator(mode="after")
+    def valid_gateway(self):
+        url = urlsplit(self.url)
+        if (
+            url.scheme not in {"http", "https"}
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError(
+                "MCP URL must be an HTTP(S) endpoint URL without credentials, query, or fragment"
+            )
+        return self
 
 
 class OpenWebUIConfig(BaseModel):
@@ -91,15 +155,48 @@ class Profile(BaseModel):
     permission_mode: Literal["default", "plan"] = "default"
     allowed_tools: list[str] = Field(default_factory=lambda: sorted(READ_TOOLS))
     system_prompt: str = ""
+    # Load CLAUDE.md (Claude) or AGENTS.md (Codex) from the working directory.
+    project_instructions: bool = True
+    # Let Claude load folder-level MCP servers (.mcp.json). Their tools stay
+    # denied unless listed in allowed_tools as "mcp__server" or "mcp__server__tool".
+    project_mcp: bool = False
     max_turns: int = Field(default=30, ge=1)
     openwebui: OpenWebUIConfig | None = None
 
+    mcp_servers: dict[str, RemoteMCPConfig] = Field(default_factory=dict)
+
+    @field_validator("mcp_servers")
+    @classmethod
+    def valid_server_names(cls, servers):
+        import re
+
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name) for name in servers):
+            raise ValueError(
+                "MCP server names must be 1-32 letters, digits, underscores or hyphens"
+            )
+        return servers
+
     @model_validator(mode="after")
     def read_only(self):
-        if self.backend == "claude" and not set(self.allowed_tools) <= READ_TOOLS:
-            raise ValueError("Claude profiles currently support only Read, Glob, and Grep")
-        if self.backend == "codex" and self.allowed_tools:
-            raise ValueError("Codex profiles must set allowed_tools = []")
+        def project_tool(tool: str) -> bool:
+            # mcp__openwebui is the bridge's own server; it is configured separately.
+            return self.project_mcp and mcp_server(tool) not in (None, "openwebui")
+
+        if self.backend == "claude" and not all(
+            t in READ_TOOLS or project_tool(t) for t in self.allowed_tools
+        ):
+            raise ValueError(
+                "Claude profiles currently support only Read, Glob, and Grep"
+                " (plus mcp__server[__tool][*] entries when project_mcp = true)"
+            )
+        if self.backend == "codex":
+            if not all(project_tool(t) for t in self.allowed_tools):
+                raise ValueError(
+                    "Codex profiles must set allowed_tools = [] (or mcp__server[__tool] "
+                    "entries when project_mcp = true)"
+                )
+            for tool in self.allowed_tools:
+                split_mcp_pattern(tool)
         if self.backend == "codex" and self.permission_mode != "default":
             raise ValueError(
                 "Codex profiles use permission_mode = 'default' with a read-only sandbox"
@@ -126,7 +223,7 @@ def load_settings(path: Path) -> Settings:
     with path.open("rb") as file:
         raw = tomllib.load(file)
     load_dotenv(path.parent / ".env", override=False)
-    unexpected = set(raw) - {"server", "profiles", "openwebui"}
+    unexpected = set(raw) - {"server", "profiles", "openwebui", "mcp_servers"}
     if unexpected:
         raise ValueError(f"Unknown configuration sections: {sorted(unexpected)}")
     server = raw.get("server", {}).copy()
@@ -139,7 +236,10 @@ def load_settings(path: Path) -> Settings:
     shared_openwebui = raw.get("openwebui")
     if shared_openwebui is not None:
         shared_openwebui = OpenWebUIConfig.model_validate(shared_openwebui).model_dump()
+    shared_mcp_servers = raw.get("mcp_servers", {})
     for profile in profiles.values():
+        if "mcp_servers" not in profile:
+            profile["mcp_servers"] = shared_mcp_servers
         profile["cwd"] = (path.parent / Path(profile["cwd"]).expanduser()).resolve()
         overrides = profile.get("openwebui")
         if overrides is False:

@@ -130,6 +130,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 cwd=profile.cwd,
                 model=settings.task_model,
                 allowed_tools=[],
+                project_instructions=False,
                 max_turns=2,
                 system_prompt="Complete the standalone text task using only the supplied "
                 "conversation. Return exactly the requested output. Do not use tools or "
@@ -141,7 +142,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         try:
             # Changing the configured API identity must not reuse another user's
             # native session. Store only a digest, never the API key itself.
-            integration_identity = digest(connection_env(profile.openwebui))
+            integration_identity = digest(connection_env(profile.openwebui, profile.mcp_servers))
         except ValueError as exc:
             raise HTTPException(503, str(exc)) from None
         chat_id = request.headers.get("x-openwebui-chat-id")

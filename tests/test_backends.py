@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import sys
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -99,7 +100,7 @@ async def test_claude_token_stream_tool_inputs_and_no_duplicate_text(tmp_path, m
     assert client.closed
     assert client.options.resume == "old"
     assert client.options.tools == ["Glob", "Grep", "Read"]
-    assert client.options.setting_sources == []
+    assert client.options.setting_sources == ["project"]
     assert client.options.strict_mcp_config
     assert client.options.verbatim_prompts
     hook = client.options.hooks["PreToolUse"][0].hooks[0]
@@ -204,7 +205,8 @@ else:
 """)
     paths = []
 
-    def command(_profile, _resume, images):
+    def command(_profile, _resume, images, gateway_tools=None):
+        assert gateway_tools == []
         paths.extend(Path(image) for image in images)
         assert len(images) == 2
         assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
@@ -297,3 +299,77 @@ async def test_codex_failure_no_success_result(tmp_path, monkeypatch):
     profile = Profile(cwd=tmp_path, backend="codex", allowed_tools=[])
     with pytest.raises(RuntimeError):
         _ = [e async for e in CodexBackend().stream(profile, "hello", None)]
+
+
+def test_project_instructions_toggle(tmp_path):
+    enabled = codex_command(Profile(cwd=tmp_path, backend="codex", allowed_tools=[]), None)
+    disabled = codex_command(
+        Profile(cwd=tmp_path, backend="codex", allowed_tools=[], project_instructions=False), None
+    )
+    assert "project_doc_max_bytes=0" not in enabled
+    assert "project_doc_max_bytes=0" in disabled
+
+
+async def test_project_mcp_opt_in(tmp_path, monkeypatch):
+    profile = Profile(
+        cwd=tmp_path,
+        project_mcp=True,
+        allowed_tools=["Read", "mcp__docs", "mcp__git__log", "mcp__wiki*"],
+    )
+    client = mock_client(monkeypatch, [result()])
+    [e async for e in ClaudeBackend().stream(profile, "p", None)]
+    assert not client.options.strict_mcp_config
+    assert client.options.setting_sources == ["project", "local"]
+    assert client.options.tools == ["Read"]
+    assert {"mcp__docs", "mcp__git", "mcp__wiki"} <= set(client.options.allowed_tools)
+    hook = client.options.hooks["PreToolUse"][0].hooks[0]
+    for name in ("Read", "mcp__docs__search", "mcp__git__log", "mcp__wiki__x", "mcp__wiki2__y"):
+        assert await hook({"tool_name": name}, None, None) == {}
+    for name in ("mcp__git__push", "mcp__other__x", "mcp__openwebui__x", "Bash"):
+        assert "hookSpecificOutput" in await hook({"tool_name": name}, None, None)
+
+
+def test_project_mcp_validation(tmp_path):
+    with pytest.raises(ValueError):
+        Profile(cwd=tmp_path, allowed_tools=["mcp__docs"])
+    with pytest.raises(ValueError):
+        Profile(cwd=tmp_path, project_mcp=True, allowed_tools=["mcp__openwebui__x"])
+    with pytest.raises(ValueError):
+        Profile(cwd=tmp_path, backend="codex", allowed_tools=["mcp__docs"])
+    with pytest.raises(ValueError):
+        Profile(
+            cwd=tmp_path,
+            backend="codex",
+            project_mcp=True,
+            allowed_tools=["mcp__docs__read_*"],
+        )
+
+
+def test_codex_project_mcp_forwards_declared_servers(tmp_path):
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '[mcp_servers.basic-memory]\nurl = "http://localhost:10888/mcp"\n'
+        '[mcp_servers.other]\ncommand = "x"\nenv = {A = "b"}\n'
+    )
+    profile = Profile(
+        cwd=tmp_path,
+        backend="codex",
+        project_mcp=True,
+        allowed_tools=["mcp__basic-memory*", "mcp__other__ping"],
+    )
+    command = codex_command(profile, None)
+    overrides = [v for f, v in pairwise(command) if f == "-c"]
+    memory = next(v for v in overrides if v.startswith("mcp_servers.basic-memory="))
+    other = next(v for v in overrides if v.startswith("mcp_servers.other="))
+    assert '"url" = "http://localhost:10888/mcp"' in memory
+    assert "enabled_tools" not in memory
+    assert '"default_tools_approval_mode" = "approve"' in memory
+    assert '"enabled_tools" = ["ping"]' in other
+    assert '"env" = {"A" = "b"}' in other
+    # Undeclared servers fail loudly instead of silently exposing nothing.
+    missing = Profile(cwd=tmp_path, backend="codex", project_mcp=True, allowed_tools=["mcp__nope"])
+    with pytest.raises(ValueError, match="nope"):
+        codex_command(missing, None)
+    # Without the opt-in nothing from the folder is forwarded.
+    plain = codex_command(Profile(cwd=tmp_path, backend="codex", allowed_tools=[]), None)
+    assert not any("basic-memory" in part for part in plain)

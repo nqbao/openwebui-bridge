@@ -11,7 +11,13 @@ from test_backends import mock_client, result
 
 from openwebui_bridge.app import create_app
 from openwebui_bridge.backends import ClaudeBackend, Done, Text, codex_command
-from openwebui_bridge.config import OpenWebUIConfig, Profile, Settings, load_settings
+from openwebui_bridge.config import (
+    OpenWebUIConfig,
+    Profile,
+    RemoteMCPConfig,
+    Settings,
+    load_settings,
+)
 from openwebui_bridge.openwebui_mcp import (
     CONFIG_ENV,
     TOKEN_ENV,
@@ -409,7 +415,8 @@ async def test_empty_memories_search_is_empty_not_an_error():
     assert calls == ["/api/v1/memories/"]
 
 
-async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("integration_kind", ["webui", "mcp"])
+async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch, integration_kind):
     class Backend:
         def __init__(self):
             self.calls = []
@@ -420,8 +427,14 @@ async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch):
             yield Done(f"session-{len(self.calls)}")
 
     backend = Backend()
-    config = OpenWebUIConfig(url="http://webui")
-    profile = Profile(cwd=tmp_path, openwebui=config)
+    key_env = "OPENWEBUI_API_KEY" if integration_kind == "webui" else "TEST_MCP_KEY"
+    config = OpenWebUIConfig(url="http://webui") if integration_kind == "webui" else None
+    servers = (
+        {"remote": RemoteMCPConfig(url="http://gateway/mcp", api_key_env=key_env)}
+        if integration_kind == "mcp"
+        else {}
+    )
+    profile = Profile(cwd=tmp_path, openwebui=config, mcp_servers=servers)
     app = create_app(
         Settings(profiles={"agent": profile}, database=tmp_path / "sessions.db"),
         {"claude": backend},
@@ -439,10 +452,10 @@ async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch):
             )
 
         history = [{"role": "user", "content": "first"}]
-        monkeypatch.delenv("OPENWEBUI_API_KEY", raising=False)
+        monkeypatch.delenv(key_env, raising=False)
         assert (await request(history)).status_code == 503
         assert not backend.calls
-        monkeypatch.setenv("OPENWEBUI_API_KEY", "first-identity-key")
+        monkeypatch.setenv(key_env, "first-identity-key")
         assert (await request(history)).status_code == 200
         history += [
             {"role": "assistant", "content": "answer"},
@@ -450,13 +463,14 @@ async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch):
         ]
         await request(history)
         assert backend.calls[-1][2] == "session-1"
-        monkeypatch.setenv("OPENWEBUI_API_KEY", "other-identity-key")
+        monkeypatch.setenv(key_env, "other-identity-key")
         await request(history)
         assert backend.calls[-1][2] is None
         await request(history, stream=False)
         assert backend.calls[-1][0].openwebui is None
+        assert backend.calls[-1][0].mcp_servers == {}
         assert backend.calls[-1][0].allowed_tools == []
-        monkeypatch.delenv("OPENWEBUI_API_KEY")
+        monkeypatch.delenv(key_env)
         assert (await request(history, stream=False)).status_code == 200
         assert b"identity-key" not in (tmp_path / "sessions.db").read_bytes()
 
@@ -473,3 +487,22 @@ async def test_api_identity_changes_and_background_tasks(tmp_path, monkeypatch):
 def test_invalid_connection_configuration(values):
     with pytest.raises(ValueError):
         OpenWebUIConfig(**values)
+
+
+def test_instructions_cover_only_enabled_tools():
+    from openwebui_bridge.config import OpenWebUIConfig
+    from openwebui_bridge.openwebui_mcp import build_instructions
+
+    config = OpenWebUIConfig(
+        url="http://localhost:3000",
+        knowledge=False,
+        memory=False,
+        notes=True,
+        chat_history=True,
+    )
+    text = build_instructions(config)
+    assert "Notes" in text and "search_chats" in text
+    assert "memor" not in text.lower() and "Knowledge" not in text
+    assert "upstream" not in text
+    assert "upstream" in build_instructions(config, upstream=True)
+    assert build_instructions(None) == ""

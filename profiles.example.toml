@@ -24,6 +24,14 @@ task_timeout_seconds = 60
 # knowledge_ids = [] # All bases accessible to the configured account.
 # timeout_seconds = 30
 
+# Optional upstream MCP tools through the same stdio adapter (shared by profiles).
+# Independent of [openwebui]; no Open WebUI connection or key is required.
+# [mcp_servers.litellm]
+# url = "http://127.0.0.1:4000/mcp"
+# api_key_env = "LITELLM_API_KEY" # Optional for servers without authentication.
+# timeout_seconds = 30
+# prefix = "tools_" # Omit for litellm_; use "" to preserve upstream names.
+
 [profiles."claude-code:myrepo"]
 backend = "claude"
 cwd = "."
@@ -31,6 +39,9 @@ model = "sonnet"
 permission_mode = "default"
 allowed_tools = ["Read", "Glob", "Grep"]
 system_prompt = "Help the user understand this repository. You have read-only tools."
+project_instructions = true # Load CLAUDE.md from cwd; false ignores it.
+# project_mcp = true # Load cwd/.mcp.json servers; also list their tools, e.g.
+# allowed_tools = ["Read", "Glob", "Grep", "mcp__myserver"] # or "mcp__myserver__tool"
 max_turns = 30
 
 # Optional profile overrides. Other settings inherit from [openwebui].
@@ -52,7 +63,9 @@ max_turns = 30
 backend = "codex"
 cwd = "."
 permission_mode = "default"
-allowed_tools = []
+allowed_tools = [] # With project_mcp = true: ["mcp__server", "mcp__server__tool"].
+# project_mcp = true # Forward listed servers from cwd/.codex/config.toml.
+project_instructions = true # Load AGENTS.md from cwd; false ignores it.
 max_turns = 30
 
 # To disable inherited integration, add openwebui = false inside the profile

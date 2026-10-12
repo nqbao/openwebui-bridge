@@ -231,8 +231,17 @@ cannot reliably be distinguished from a normal chat turn.
 Claude profiles expose `Read`, `Glob`, and `Grep` plus explicitly configured
 Open WebUI Knowledge/Memory tools. Both the available tools
 and auto-approved tools are restricted, and a pre-tool hook denies tools outside
-the list. Approval requests are denied because there is no approval UI. Host and
-project settings/MCP configuration are disabled; the bridge injects its own
+the list. Approval requests are denied because there is no approval UI. User
+settings and all MCP configuration are disabled; project settings (including
+`CLAUDE.md`) load from `cwd` unless the profile sets
+`project_instructions = false` (Codex: `AGENTS.md`). Folder-level MCP servers
+(`.mcp.json`) are ignored unless a Claude profile sets `project_mcp = true`;
+their tools are still denied until listed in `allowed_tools` as `mcp__server`
+(whole server), `mcp__server__tool`, or a `*` glob such as `mcp__server*`. Codex profiles can also set `project_mcp = true`: the bridge reads
+`cwd/.codex/config.toml` itself (Codex only loads it for trusted projects, and
+trust lives in the user config the bridge ignores) and forwards only the listed
+servers, auto-approving their enabled tools; Codex supports `mcp__server` or
+exact `mcp__server__tool` (no partial globs). The bridge injects its own
 Open WebUI MCP server when enabled. `permission_mode` supports
 `default` and `plan`; `model`, `system_prompt`, and `max_turns` are configurable.
 This is a read-only tool policy, not a filesystem jail: read tools may access
@@ -252,6 +261,55 @@ Both Claude and Codex can search Open WebUI directly during their turns using
 the bridge's built-in stdio MCP adapter. No separate MCP server installation or
 Open WebUI tool-server connection is needed. Knowledge, Memory, Notes, and chat history are
 exposed; Open WebUI's other built-in tools are not forwarded.
+
+### Forwarding remote MCP servers through the same adapter
+
+The adapter can also connect to standard **Streamable HTTP MCP** endpoints,
+including LiteLLM's `/mcp` gateway. Agents still see one MCP server (`openwebui`);
+each upstream tool appears individually with its description, input/output schemas,
+annotations, and MCP result content. There is no generic list/call wrapper tool.
+
+```toml
+# Independent of the optional [openwebui] configuration.
+[mcp_servers.litellm]
+url = "http://127.0.0.1:4000/mcp" # Full MCP endpoint, not the REST API base URL.
+api_key_env = "LITELLM_API_KEY" # Bearer token; omit for an unauthenticated endpoint.
+timeout_seconds = 30
+prefix = "tools_" # Optional literal prefix, including any desired separator.
+```
+
+No Open WebUI connection or API key is required to use remote MCP servers.
+Put `LITELLM_API_KEY` in `.env` or the environment. The same settings work under
+`[profiles."codex:myrepo".mcp_servers.litellm]` for profile-specific access.
+The `mcp_servers` table replaces the inherited table when overridden; use
+`mcp_servers = {}` inside a profile's main table to disable inherited servers.
+
+Without `prefix`, the configured server name plus `_` is used: an upstream
+`github-search` tool becomes `litellm_github-search`. With `prefix = "tools_"`, it
+becomes `tools_github-search`; with `prefix = ""`, it stays `github-search`.
+Prefixes accept letters, digits, underscores and hyphens (up to 32 characters).
+Names are normalized to those characters and names over 64 characters receive a
+short hash suffix. Duplicate exposed names, including collisions with local tools,
+fail discovery rather than dispatching ambiguously.
+
+All tools visible to the configured upstream credential are exposed and
+auto-approved for both Claude and Codex. Use the upstream server/gateway's key
+permissions to limit access; this can include external write/action tools beyond
+the agent's read-only filesystem policy. Forwarded WebUI user IDs do not change
+the upstream identity. Changing credentials or prefix changes the native-session scope.
+Background title/tag tasks do not receive these tools.
+
+The adapter keeps upstream MCP sessions open during its lifetime, forwards
+`tools/list` (including pagination) and `tools/call`, and preserves MCP error results.
+Both backends discover names before each turn to build their allowed-tool lists;
+newly added tools become available on the next turn. If discovery fails, the turn
+fails instead of silently running without the configured tools. An upstream tool
+catalog change during a turn may require starting another turn.
+This forwards tools only: MCP resources, prompts, sampling, elicitation, stdio
+upstreams and legacy SSE transport are not exposed. OAuth must already be handled
+by the gateway; the bridge supports optional bearer credentials, not interactive login.
+Run the existing `--profile` connectivity check to verify upstream discovery without
+executing action tools.
 
 Add shared defaults in `profiles.toml` to enable every Claude and Codex profile:
 

@@ -9,8 +9,17 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Profile
-from .openwebui_mcp import CONFIG_ENV, INSTRUCTIONS, TOKEN_ENV, connection_env, server_command
+from .config import Profile, load_project_mcp, mcp_matches, mcp_server, split_mcp_pattern
+from .openwebui_mcp import (
+    CONFIG_ENV,
+    MCP_CONFIG_ENV,
+    MCP_TOKENS_ENV,
+    TOKEN_ENV,
+    build_instructions,
+    connection_env,
+    discover_upstream_tools,
+    server_command,
+)
 from .protocol import Prompt, tool_line
 
 
@@ -43,17 +52,27 @@ class ClaudeBackend:
         mcp_tools = (
             [f"mcp__openwebui__{name}" for name in integration.tool_names()] if integration else []
         )
-        allowed_tools = profile.allowed_tools + mcp_tools
-        environment = connection_env(integration)
+        gateway_tools = await discover_upstream_tools(profile.mcp_servers)
+        mcp_tools += [f"mcp__openwebui__{name}" for name in gateway_tools]
+        # The SDK sees server-level rules; the hook below enforces exact patterns.
+        project_tools = [t for t in profile.allowed_tools if t.startswith("mcp__")]
+        server_rules = sorted({f"mcp__{mcp_server(t)}" for t in project_tools})
+        allowed_tools = [t for t in profile.allowed_tools if t not in project_tools]
+        allowed_tools += mcp_tools + server_rules
+        environment = connection_env(integration, profile.mcp_servers)
         system_prompt = profile.system_prompt
         if mcp_tools:
-            system_prompt += "\n\n" + INSTRUCTIONS
+            system_prompt += "\n\n" + build_instructions(integration, bool(gateway_tools))
 
         async def deny_approval(_name, _inputs, _context):
             return PermissionResultDeny(message="This proxy has no interactive approval UI")
 
         async def restrict_tools(data, _tool_use_id, _context):
-            if data.get("tool_name") not in allowed_tools:
+            name = data.get("tool_name")
+            if name not in allowed_tools and not (
+                not name.startswith("mcp__openwebui__")
+                and any(mcp_matches(tool, name) for tool in project_tools)
+            ):
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -66,7 +85,7 @@ class ClaudeBackend:
         options = ClaudeAgentOptions(
             cwd=str(profile.cwd),
             model=profile.model,
-            tools=profile.allowed_tools,
+            tools=[t for t in profile.allowed_tools if not t.startswith("mcp__")],
             allowed_tools=allowed_tools,
             permission_mode=profile.permission_mode,
             system_prompt={
@@ -78,9 +97,16 @@ class ClaudeBackend:
             else system_prompt,
             mcp_servers={"openwebui": {"type": "stdio", **server_command()}} if mcp_tools else {},
             env=environment,
-            setting_sources=[],
-            # Ignore MCP servers from host/project config, including on resume.
-            strict_mcp_config=True,
+            # "local" is where `claude mcp add` stores per-directory servers
+            # (~/.claude.json) and without it they are not discovered.
+            setting_sources=["project", "local"]
+            if profile.project_mcp
+            else ["project"]
+            if profile.project_instructions
+            else [],
+            # Ignore MCP servers from host/project config, including on resume,
+            # unless the profile opts in to folder-level servers.
+            strict_mcp_config=not profile.project_mcp,
             verbatim_prompts=True,
             hooks={"PreToolUse": [HookMatcher(hooks=[restrict_tools])]},
             can_use_tool=deny_approval,
@@ -163,8 +189,48 @@ class ClaudeBackend:
         yield result
 
 
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, dict):
+        items = ", ".join(f"{json.dumps(str(k))} = {toml_value(v)}" for k, v in value.items())
+        return "{" + items + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return json.dumps(value) if isinstance(value, str) else str(value)
+
+
+def project_mcp_overrides(profile: Profile) -> list[str]:
+    """Forward allowed servers from the folder's .codex/config.toml as inline config.
+
+    Codex only reads project config for trusted projects, and trust lives in the
+    user config that --ignore-user-config skips, so the bridge passes them itself.
+    """
+    wanted: dict[str, set[str] | None] = {}
+    for pattern in profile.allowed_tools:
+        server, tool = split_mcp_pattern(pattern)
+        if tool is None:
+            wanted[server] = None
+        elif wanted.get(server, set()) is not None:
+            wanted.setdefault(server, set()).add(tool)
+    declared = load_project_mcp(profile.cwd)
+    command = []
+    for server, tools in wanted.items():
+        if server not in declared:
+            raise ValueError(f"MCP server {server!r} is not in {profile.cwd}/.codex/config.toml")
+        config = {**declared[server], "required": False, "default_tools_approval_mode": "approve"}
+        config.pop("enabled_tools", None)
+        if tools is not None:
+            config["enabled_tools"] = sorted(tools)
+        command += ["-c", f"mcp_servers.{server}=" + toml_value(config)]
+    return command
+
+
 def codex_command(
-    profile: Profile, resume: str | None, images: list[str] | None = None
+    profile: Profile,
+    resume: str | None,
+    images: list[str] | None = None,
+    gateway_tools: list[str] | None = None,
 ) -> list[str]:
     # Put parent exec flags before resume: the resume subcommand has fewer flags.
     command = [
@@ -183,15 +249,29 @@ def codex_command(
     ]
     if profile.model:
         command += ["--model", profile.model]
+    if not profile.project_instructions:
+        command += ["-c", "project_doc_max_bytes=0"]  # Skip AGENTS.md.
+    if profile.project_mcp:
+        command += project_mcp_overrides(profile)
     system_prompt = profile.system_prompt
-    if profile.openwebui and profile.openwebui.tool_names():
+    if (profile.openwebui and profile.openwebui.tool_names()) or profile.mcp_servers:
         config = {
             **server_command(),
-            "env_vars": [CONFIG_ENV, TOKEN_ENV],
-            "enabled_tools": profile.openwebui.tool_names(),
+            "env_vars": [CONFIG_ENV, TOKEN_ENV]
+            + ([MCP_CONFIG_ENV, MCP_TOKENS_ENV] if profile.mcp_servers else []),
+            "enabled_tools": (profile.openwebui.tool_names() if profile.openwebui else [])
+            + (gateway_tools or []),
             "required": True,
-            "startup_timeout_sec": 20,
-            "tool_timeout_sec": profile.openwebui.timeout_seconds + 10,
+            "startup_timeout_sec": 20
+            + sum(upstream.timeout_seconds for upstream in profile.mcp_servers.values()),
+            "tool_timeout_sec": max(
+                profile.openwebui.timeout_seconds if profile.openwebui else 0,
+                max(
+                    (upstream.timeout_seconds for upstream in profile.mcp_servers.values()),
+                    default=0,
+                ),
+            )
+            + 10,
         }
         # JSON string quoting is TOML-compatible; values contain no credentials.
         table = (
@@ -203,13 +283,15 @@ def codex_command(
             + "}"
         )
         command += ["-c", "mcp_servers.openwebui=" + table]
-        if profile.openwebui.memory_write:
+        for name in gateway_tools or []:
+            command += ["-c", f'mcp_servers.openwebui.tools.{name}.approval_mode="approve"']
+        if profile.openwebui and profile.openwebui.memory_write:
             for tool in ("add_memory", "update_memory", "delete_memory"):
                 command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
-        if profile.openwebui.notes_write:
+        if profile.openwebui and profile.openwebui.notes_write:
             for tool in ("create_note", "update_note", "delete_note"):
                 command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
-        system_prompt += "\n\n" + INSTRUCTIONS
+        system_prompt += "\n\n" + build_instructions(profile.openwebui, bool(gateway_tools))
     if system_prompt:
         command += ["-c", "developer_instructions=" + json.dumps(system_prompt)]
     if resume:
@@ -250,15 +332,16 @@ class CodexBackend:
     async def _stream(
         self, profile: Profile, prompt: str, resume: str | None, images: list[str]
     ) -> AsyncIterator:
+        gateway_tools = await discover_upstream_tools(profile.mcp_servers)
         process = await asyncio.create_subprocess_exec(
-            *codex_command(profile, resume, images),
+            *codex_command(profile, resume, images, gateway_tools),
             cwd=profile.cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=4 * 1024 * 1024,
-            env={**os.environ, **connection_env(profile.openwebui)},
+            env={**os.environ, **connection_env(profile.openwebui, profile.mcp_servers)},
         )
 
         async def write_prompt():
