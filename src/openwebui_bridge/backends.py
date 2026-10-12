@@ -9,7 +9,14 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Profile, load_project_mcp, mcp_matches, mcp_server, split_mcp_pattern
+from .config import (
+    Profile,
+    load_project_mcp,
+    mcp_matches,
+    mcp_server,
+    split_mcp_pattern,
+    tool_base,
+)
 from .openwebui_mcp import (
     CONFIG_ENV,
     MCP_CONFIG_ENV,
@@ -69,7 +76,9 @@ class ClaudeBackend:
 
         async def restrict_tools(data, _tool_use_id, _context):
             name = data.get("tool_name")
-            if name not in allowed_tools and not (
+            # Specifiers such as Bash(git diff:*) are enforced by the CLI's own
+            # permission rules; unmatched calls reach deny_approval below.
+            if name not in {tool_base(t) for t in allowed_tools} and not (
                 not name.startswith("mcp__openwebui__")
                 and any(mcp_matches(tool, name) for tool in project_tools)
             ):
@@ -85,7 +94,9 @@ class ClaudeBackend:
         options = ClaudeAgentOptions(
             cwd=str(profile.cwd),
             model=profile.model,
-            tools=[t for t in profile.allowed_tools if not t.startswith("mcp__")],
+            tools=sorted(
+                {tool_base(t) for t in profile.allowed_tools if not t.startswith("mcp__")}
+            ),
             allowed_tools=allowed_tools,
             permission_mode=profile.permission_mode,
             system_prompt={

@@ -657,8 +657,10 @@ def test_config_paths_and_read_only_enforcement(tmp_path):
     path.write_text('[profiles."claude-code:test"]\ncwd = "."\n')
     settings = load_settings(path)
     assert settings.profiles["claude-code:test"].cwd == tmp_path
-    with pytest.raises(ValueError, match="only Read"):
-        Profile(cwd=tmp_path, allowed_tools=["Bash"])
+    with pytest.raises(ValueError, match="Read, Glob, Grep"):
+        Profile(cwd=tmp_path, allowed_tools=["WebFetch"])
+    coding = Profile(cwd=tmp_path, allowed_tools=["Read", "Edit", "Bash(git diff:*)"])
+    assert coding.allowed_tools == ["Read", "Edit", "Bash(git diff:*)"]
     with pytest.raises(ValueError):
         Profile(cwd=tmp_path, permission_mode="bypassPermissions")
 

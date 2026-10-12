@@ -10,6 +10,14 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
+# Opt-in only: the default allowlist stays read-only. Entries may carry a Claude
+# permission specifier, e.g. "Bash(git diff:*)" or "Edit(./src/**)".
+CODING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"})
+
+
+def tool_base(tool: str) -> str:
+    """Tool name without a permission specifier: Bash(git diff:*) -> Bash."""
+    return tool.split("(", 1)[0]
 
 
 def mcp_server(pattern: str) -> str | None:
@@ -183,11 +191,12 @@ class Profile(BaseModel):
             return self.project_mcp and mcp_server(tool) not in (None, "openwebui")
 
         if self.backend == "claude" and not all(
-            t in READ_TOOLS or project_tool(t) for t in self.allowed_tools
+            tool_base(t) in READ_TOOLS | CODING_TOOLS or project_tool(t) for t in self.allowed_tools
         ):
             raise ValueError(
-                "Claude profiles currently support only Read, Glob, and Grep"
-                " (plus mcp__server[__tool][*] entries when project_mcp = true)"
+                "Claude profiles support Read, Glob, Grep, Edit, MultiEdit, Write, "
+                "NotebookEdit, and Bash (plus mcp__server[__tool][*] entries when "
+                "project_mcp = true)"
             )
         if self.backend == "codex":
             if not all(project_tool(t) for t in self.allowed_tools):

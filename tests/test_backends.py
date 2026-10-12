@@ -373,3 +373,16 @@ def test_codex_project_mcp_forwards_declared_servers(tmp_path):
     # Without the opt-in nothing from the folder is forwarded.
     plain = codex_command(Profile(cwd=tmp_path, backend="codex", allowed_tools=[]), None)
     assert not any("basic-memory" in part for part in plain)
+
+
+async def test_coding_tools_and_specifiers(tmp_path, monkeypatch):
+    profile = Profile(cwd=tmp_path, allowed_tools=["Read", "Edit", "Bash(git diff:*)"])
+    client = mock_client(monkeypatch, [result()])
+    [e async for e in ClaudeBackend().stream(profile, "p", None)]
+    assert client.options.tools == ["Bash", "Edit", "Read"]
+    assert "Bash(git diff:*)" in client.options.allowed_tools
+    hook = client.options.hooks["PreToolUse"][0].hooks[0]
+    for name in ("Edit", "Bash"):
+        assert await hook({"tool_name": name}, None, None) == {}
+    for name in ("Write", "WebFetch"):
+        assert "hookSpecificOutput" in await hook({"tool_name": name}, None, None)

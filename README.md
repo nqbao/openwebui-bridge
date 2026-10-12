@@ -228,7 +228,11 @@ cannot reliably be distinguished from a normal chat turn.
 
 ## Profiles
 
-Claude profiles expose `Read`, `Glob`, and `Grep` plus explicitly configured
+Claude profiles default to `Read`, `Glob`, and `Grep`; `Edit`, `MultiEdit`,
+`Write`, `NotebookEdit`, and `Bash` can be added explicitly to `allowed_tools`
+(optionally scoped, e.g. `Bash(git diff:*)`, `Edit(./src/**)`) to make a coding
+agent. They run unattended as the host account, so scope them. Claude profiles also expose
+explicitly configured
 Open WebUI Knowledge/Memory tools. Both the available tools
 and auto-approved tools are restricted, and a pre-tool hook denies tools outside
 the list. Approval requests are denied because there is no approval UI. User
@@ -244,8 +248,8 @@ servers, auto-approving their enabled tools; Codex supports `mcp__server` or
 exact `mcp__server__tool` (no partial globs). The bridge injects its own
 Open WebUI MCP server when enabled. `permission_mode` supports
 `default` and `plan`; `model`, `system_prompt`, and `max_turns` are configurable.
-This is a read-only tool policy, not a filesystem jail: read tools may access
-files outside `cwd` that the host account can read.
+This is a tool allowlist, not a filesystem jail: unscoped read, edit, and Bash
+tools may reach files outside `cwd` that the host account can access.
 
 To enable Codex, install/authenticate its CLI and enable its example profile, then
 restart. Its model and appended developer instructions are configurable. It uses
