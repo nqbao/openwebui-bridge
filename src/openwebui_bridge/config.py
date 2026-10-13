@@ -13,6 +13,8 @@ READ_TOOLS = frozenset({"Read", "Glob", "Grep"})
 # Opt-in only: the default allowlist stays read-only. Entries may carry a Claude
 # permission specifier, e.g. "Bash(git diff:*)" or "Edit(./src/**)".
 CODING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"})
+# Outbound network access; specifiers can scope it, e.g. "WebFetch(domain:example.com)".
+WEB_TOOLS = frozenset({"WebFetch", "WebSearch"})
 
 
 def tool_base(tool: str) -> str:
@@ -191,11 +193,12 @@ class Profile(BaseModel):
             return self.project_mcp and mcp_server(tool) not in (None, "openwebui")
 
         if self.backend == "claude" and not all(
-            tool_base(t) in READ_TOOLS | CODING_TOOLS or project_tool(t) for t in self.allowed_tools
+            tool_base(t) in READ_TOOLS | CODING_TOOLS | WEB_TOOLS or project_tool(t)
+            for t in self.allowed_tools
         ):
             raise ValueError(
                 "Claude profiles support Read, Glob, Grep, Edit, MultiEdit, Write, "
-                "NotebookEdit, and Bash (plus mcp__server[__tool][*] entries when "
+                "NotebookEdit, Bash, WebFetch, and WebSearch (plus mcp__server[__tool][*] entries when "
                 "project_mcp = true)"
             )
         if self.backend == "codex":

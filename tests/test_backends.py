@@ -384,5 +384,5 @@ async def test_coding_tools_and_specifiers(tmp_path, monkeypatch):
     hook = client.options.hooks["PreToolUse"][0].hooks[0]
     for name in ("Edit", "Bash"):
         assert await hook({"tool_name": name}, None, None) == {}
-    for name in ("Write", "WebFetch"):
+    for name in ("Write", "Task"):
         assert "hookSpecificOutput" in await hook({"tool_name": name}, None, None)

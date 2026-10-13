@@ -229,7 +229,8 @@ cannot reliably be distinguished from a normal chat turn.
 ## Profiles
 
 Claude profiles default to `Read`, `Glob`, and `Grep`; `Edit`, `MultiEdit`,
-`Write`, `NotebookEdit`, and `Bash` can be added explicitly to `allowed_tools`
+`Write`, `NotebookEdit`, `Bash`, `WebFetch`, and `WebSearch` can be added explicitly
+to `allowed_tools`
 (optionally scoped, e.g. `Bash(git diff:*)`, `Edit(./src/**)`) to make a coding
 agent. They run unattended as the host account, so scope them. Claude profiles also expose
 explicitly configured
