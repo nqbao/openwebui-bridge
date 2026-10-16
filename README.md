@@ -1,5 +1,9 @@
 # Open WebUI Bridge
 
+Open WebUI Bridge lets you use Claude Code and Codex through the same Open WebUI
+interface. It also gives these agents access to Open WebUI Knowledge, Memory,
+Notes, chat history, and remote MCP tools.
+
 ## Start the bridge
 
 You need macOS or Linux, Python 3.11+, and `uv`.
