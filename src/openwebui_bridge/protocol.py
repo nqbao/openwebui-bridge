@@ -2,9 +2,12 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .images import ImageDeliveryError, decode_image
 
 
 class TextPart(BaseModel):
@@ -146,7 +149,68 @@ def digest(value: object) -> str:
     ).hexdigest()
 
 
-def replay(messages: list[dict]) -> Prompt:
+_IMAGE_MARKDOWN = re.compile(
+    r"!\[(?:\\.|[^\]\\])*\]\("
+    r"(?:(data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)"
+    r"|/api/v1/files/([A-Za-z0-9_-]{1,200})/content)\)"
+)
+
+
+def uploaded_image_ids(messages: list[dict]) -> list[str]:
+    """Open WebUI file IDs of generated images in assistant history, in order."""
+    ids: list[str] = []
+    for message in messages:
+        if message["role"] == "assistant" and isinstance(message["content"], str):
+            for match in _IMAGE_MARKDOWN.finditer(message["content"]):
+                if match[2] and match[2] not in ids:
+                    ids.append(match[2])
+    return ids
+
+
+def replay(messages: list[dict], files: dict[str, tuple[bytes, str]] | None = None) -> Prompt:
+    # Preserve raw Markdown for hashing/persistence, but send embedded generated
+    # images as vision inputs on branches/restarts rather than base64 text tokens.
+    transcript = []
+    image_count = image_bytes = 0
+    for message in messages:
+        content = message["content"]
+        if message["role"] == "assistant" and isinstance(content, str):
+            parts = []
+            offset = 0
+            for match in _IMAGE_MARKDOWN.finditer(content):
+                if match[2]:
+                    # Fetched earlier; if missing, leave the link as plain text.
+                    if not files or match[2] not in files:
+                        continue
+                    data, mime_type = files[match[2]]
+                else:
+                    try:
+                        data, mime_type = decode_image(match[1])
+                    except ImageDeliveryError:
+                        continue  # Corrupt historical image: leave the Markdown as text.
+                image_count += 1
+                image_bytes += len(data)
+                if image_count > 20 or image_bytes > 40 * 1024 * 1024:
+                    raise ValueError("Generated image replay limit exceeded")
+                parts.extend(
+                    [
+                        {"type": "text", "text": content[offset : match.start()]},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": base64.b64encode(data).decode(),
+                            },
+                        },
+                    ]
+                )
+                offset = match.end()
+            if parts:
+                parts.append({"type": "text", "text": content[offset:]})
+                content = parts
+        transcript.append({**message, "content": content})
+    messages = transcript
     if len(messages) == 1 and messages[0]["role"] == "user":
         return messages[0]["content"]
     if any(isinstance(message["content"], list) for message in messages):

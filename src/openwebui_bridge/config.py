@@ -106,6 +106,8 @@ class OpenWebUIConfig(BaseModel):
     notes_write: bool = False
     chat_history: bool = False
     knowledge_ids: list[str] = Field(default_factory=list)
+    # Store generated images in Open WebUI's file store; falls back to inline base64.
+    upload_images: bool = True
     timeout_seconds: float = Field(default=30, gt=0, le=120)
 
     @field_validator("memory_path")
@@ -170,6 +172,7 @@ class Profile(BaseModel):
     # Let Claude load folder-level MCP servers (.mcp.json). Their tools stay
     # denied unless listed in allowed_tools as "mcp__server" or "mcp__server__tool".
     project_mcp: bool = False
+    codex_image_log: bool = True
     max_turns: int = Field(default=30, ge=1)
     openwebui: OpenWebUIConfig | None = None
 

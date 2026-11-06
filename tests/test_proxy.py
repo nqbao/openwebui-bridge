@@ -674,3 +674,12 @@ def test_database_lease_blocks_second_process(tmp_path):
             Store(tmp_path / "sessions.db")
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("value, isolated", [("", False), (" ", True), ("title_generation", True)])
+async def test_nonstreaming_task_header_values(tmp_path, value, isolated):
+    async with client_for(tmp_path) as (client, backend, _):
+        client.headers["X-OpenWebUI-Task"] = value
+        response = await complete(client, [msg("user", "hello")], stream=False)
+        assert response.status_code == 200
+        assert (backend.calls[-1][0].allowed_tools == []) is isolated

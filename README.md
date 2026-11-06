@@ -112,6 +112,50 @@ Use PNG, JPEG, GIF, or WebP: up to 5 MiB per image, 20 images and 20 MiB total
 per request, including history. For API clients, send inline base64 `image_url`
 parts; external image URLs are unsupported.
 
+## Display generated images
+
+Ask your Codex profile to generate a dinosaur emoji. When the profile has an
+`[openwebui]` connection and its API key is set, the bridge uploads the image to
+Open WebUI's file store and emits a same-origin link
+(`/api/v1/files/<id>/content`). Messages stay small, the browser loads the image
+from Open WebUI with its normal session, and Open WebUI owns retention and
+access. The file belongs to the API key's account, so multi-user deployments may
+not let other users view it. Set `upload_images = false` under `[openwebui]` to
+opt out.
+
+Without an `[openwebui]` connection or key, or if an upload fails, the bridge
+falls back to inline base64 Markdown, which works for remote browsers and needs
+no extra access. Base64 adds about one-third to message and export size.
+
+Keep streaming enabled. For a non-streaming chat API request, explicitly send an
+empty `X-OpenWebUI-Task` header; without that header, non-streaming requests keep
+using the isolated, tool-free Claude task profile. Nonempty task headers always
+select the task profile. Image Markdown is identical in the displayed response
+and the session hash. On a fresh session or branch, earlier inline images are
+forwarded as vision inputs rather than base64 text tokens; images stored in
+Open WebUI are fetched back with the profile's API key. If a fetch fails, the
+model sees only the link.
+
+Payload limits are 10 MiB per image, 20 images / 40 MiB per turn, and 32 million
+pixels per image; only validated PNG, JPEG, GIF and WebP are accepted. Base64
+adds about one-third to message and export size. Conversation access and
+retention are controlled by Open WebUI; images are not separately uploaded to
+its file store. Deployments must allow `data:` images in their content security
+policy. Text-only clients may show raw Markdown.
+
+Codex CLI 0.166.0 generates images but omits `image_gen.generation` completions
+from `exec --json`. The bridge supplements that stream with completed native
+image events from the active session's log under `$CODEX_HOME/sessions`
+(default `~/.codex/sessions`). This requires persisted, locally readable session
+logs and depends on Codex's private log format. It reads inline base64 results,
+never `savedPath` or arbitrary local files. Set `codex_image_log = false` in a
+profile to disable this compatibility reader. Completed MCP image blocks are
+also supported directly. Resource links without inline image bytes are
+skipped. A tool acknowledgment alone is not an image.
+
+See [image-delivery investigation](docs/generated-images.md) for the observed
+transport format and validation evidence.
+
 ## Enable Open WebUI tools
 
 1. Create an Open WebUI user API key under **Settings → Account → API Keys**.

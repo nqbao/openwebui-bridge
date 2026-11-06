@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import re
 import signal
 import tempfile
 from collections.abc import AsyncIterator
@@ -17,6 +19,7 @@ from .config import (
     split_mcp_pattern,
     tool_base,
 )
+from .images import MAX_EVENT_BYTES, ImageDeliveryError, decode_image
 from .openwebui_mcp import (
     CONFIG_ENV,
     MCP_CONFIG_ENV,
@@ -36,9 +39,137 @@ class Text:
 
 
 @dataclass(frozen=True)
+class Image:
+    data: bytes
+    mime_type: str
+    alt: str | None = None
+
+
+@dataclass(frozen=True)
 class Done:
     session_id: str
     usage: dict | None = None
+
+
+class CodexImages:
+    """Process completed results independently of tool activity deduplication."""
+
+    def __init__(self):
+        self.seen: set[bytes] = set()
+        self.total_bytes = 0
+
+    def parse(self, item: dict) -> list[Image]:
+        blocks = []
+        if item.get("type") == "Extension" and item.get("kind") == "image_gen.generation":
+            if item.get("status") != "completed":
+                return []
+            if item.get("failure") or not item.get("result"):
+                raise ImageDeliveryError("Image delivery failed: Codex returned no image payload")
+            blocks = [{"type": "image", "data": item["result"]}]
+        elif item.get("type") in {"image_generation", "image_generation_call"}:
+            if not item.get("result"):
+                raise ImageDeliveryError("Image delivery failed: Codex returned no image payload")
+            blocks = [{"type": "image", "data": item["result"]}]
+        elif item.get("type") == "mcp_tool_call":
+            result = item.get("result") or {}
+            if not isinstance(result, dict) or result.get("isError"):
+                return []
+            blocks = result.get("content") or []
+        images = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in {"resource", "resource_link"}:
+                resource = block.get("resource", block)
+                if str(resource.get("mimeType", "")).startswith("image/"):
+                    if "blob" not in resource:
+                        continue  # Reference-only image; nothing to deliver.
+                    block = {
+                        "type": "image",
+                        "data": resource["blob"],
+                        "mimeType": resource.get("mimeType"),
+                    }
+            if block.get("type") != "image":
+                continue
+            data, mime_type = decode_image(block.get("data"), block.get("mimeType"))
+            identity = hashlib.sha256(mime_type.encode() + data).digest()
+            if identity in self.seen:
+                continue
+            if len(self.seen) >= 20 or self.total_bytes + len(data) > 40 * 1024 * 1024:
+                raise ImageDeliveryError("Image delivery failed: turn image limit exceeded")
+            self.seen.add(identity)
+            self.total_bytes += len(data)
+            images.append(Image(data, mime_type))
+        return images
+
+
+class CodexImageLog:
+    """Compatibility supplement for exec JSONL omitting image_gen Extension items.
+
+    Read only this invocation's completed native items. Never open savedPath or
+    model-supplied paths, and never replay images from previous resumed turns.
+    """
+
+    def __init__(self, resume: str | None):
+        self.root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+        self.path = self.locate(resume) if resume else None
+        self.offset = self.path.stat().st_size if self.path else 0
+        self.turn_id = None
+
+    def locate(self, session_id: str) -> Path | None:
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", session_id):
+            return None
+        for path in self.root.glob(f"*/*/*/rollout-*-{session_id}.jsonl"):
+            if path.is_file() and path.resolve().is_relative_to(self.root.resolve()):
+                return path
+        return None
+
+    def read(self, session_id: str | None, until_text: str | None = None) -> list[dict]:
+        if not session_id:
+            return []
+        if self.path is None:
+            self.path = self.locate(session_id)
+        if self.path is None:
+            return []
+        items = []
+        scanned = 0
+        with self.path.open("rb") as log:
+            log.seek(self.offset)
+            while line := log.readline(MAX_EVENT_BYTES + 1):
+                scanned += len(line)
+                if scanned > 64 * 1024 * 1024:
+                    raise ImageDeliveryError("Image delivery failed: Codex log scan limit exceeded")
+                if len(line) > MAX_EVENT_BYTES:
+                    raise ImageDeliveryError(
+                        "Image delivery failed: Codex result exceeds event limit"
+                    )
+                if not line.endswith(b"\n"):
+                    break  # A concurrent writer has not finished this record yet.
+                self.offset = log.tell()
+                record = json.loads(line)
+                if record.get("type") != "event_msg":
+                    continue
+                payload = record.get("payload", {})
+                if payload.get("type") == "task_started":
+                    self.turn_id = payload.get("turn_id")
+                elif (
+                    self.turn_id
+                    and payload.get("type") == "item_completed"
+                    and payload.get("thread_id") == session_id
+                    and payload.get("turn_id") == self.turn_id
+                ):
+                    item = payload.get("item", {})
+                    if item.get("type") == "Extension":
+                        items.append(item)
+                    elif until_text is not None and item.get("type") == "AgentMessage":
+                        text = "".join(
+                            part.get("text", "")
+                            for part in item.get("content", [])
+                            if part.get("type") == "Text"
+                        )
+                        if text == until_text:
+                            break
+        return items
 
 
 class ClaudeBackend:
@@ -344,6 +475,8 @@ class CodexBackend:
         self, profile: Profile, prompt: str, resume: str | None, images: list[str]
     ) -> AsyncIterator:
         gateway_tools = await discover_upstream_tools(profile.mcp_servers)
+        image_log = CodexImageLog(resume) if profile.codex_image_log else None
+        image_results = CodexImages()
         process = await asyncio.create_subprocess_exec(
             *codex_command(profile, resume, images, gateway_tools),
             cwd=profile.cwd,
@@ -351,7 +484,7 @@ class CodexBackend:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            limit=4 * 1024 * 1024,
+            limit=MAX_EVENT_BYTES,
             env={**os.environ, **connection_env(profile.openwebui, profile.mcp_servers)},
         )
 
@@ -378,17 +511,32 @@ class CodexBackend:
                 kind = event.get("type")
                 if kind == "thread.started":
                     session_id = event["thread_id"]
+                message = event.get("item")
+                if not isinstance(message, dict):
+                    message = {}
+                text_boundary = kind == "item.completed" and message.get("type") == "agent_message"
+                if image_log and (text_boundary or kind == "turn.completed"):
+                    for item in image_log.read(
+                        session_id, (message.get("text") or "") if text_boundary else None
+                    ):
+                        for image in image_results.parse(item):
+                            yield image
+                if kind == "thread.started":
+                    continue
                 elif kind == "turn.completed":
                     completed = True
                     usage = event.get("usage")
                 elif kind in {"turn.failed", "error"}:
                     raise RuntimeError("Codex reported a failed turn")
                 elif kind in {"item.started", "item.completed"}:
-                    item = event.get("item", {})
+                    item = message
                     item_id = item.get("id")
                     item_type = item.get("type")
+                    if kind == "item.completed":
+                        for image in image_results.parse(item):
+                            yield image
                     if item_type == "agent_message" and kind == "item.completed":
-                        yield Text(item.get("text", ""))
+                        yield Text(item.get("text") or "")
                     elif (
                         item_type
                         in {"command_execution", "mcp_tool_call", "web_search", "file_change"}
@@ -398,6 +546,10 @@ class CodexBackend:
                         yield Text(tool_line(item_type, item))
             await writer
             code = await process.wait()
+            if image_log:
+                for item in image_log.read(session_id):
+                    for image in image_results.parse(item):
+                        yield image
             if code != 0 or not completed or not session_id:
                 raise RuntimeError("Codex exited without a successful completed turn")
         finally:

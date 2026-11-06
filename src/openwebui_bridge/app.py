@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import hmac
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import aclosing, asynccontextmanager
@@ -9,11 +11,13 @@ from contextlib import aclosing, asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from mcp.server.mcpserver.exceptions import ToolError
 
-from .backends import ClaudeBackend, CodexBackend, Done, Text
+from .backends import ClaudeBackend, CodexBackend, Done, Image, Text
 from .config import Profile, Settings
-from .openwebui_mcp import connection_env
-from .protocol import CompletionRequest, digest, replay
+from .images import ImageDeliveryError, validate_image
+from .openwebui_mcp import OpenWebUIClient, connection_env
+from .protocol import CompletionRequest, digest, replay, uploaded_image_ids
 from .store import ChatLocks, Store
 
 logger = logging.getLogger(__name__)
@@ -120,7 +124,10 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         profile = settings.profiles.get(body.model)
         if profile is None:
             raise HTTPException(404, f"Unknown agent profile: {body.model}")
-        isolated = not body.stream or bool(request.headers.get("x-openwebui-task", "").strip())
+        # An exactly empty header is the explicit opt-in to foreground chat for
+        # non-streaming clients; any other value (including whitespace) is a task.
+        task_header = request.headers.get("x-openwebui-task")
+        isolated = (task_header is None and not body.stream) or bool(task_header)
         timeout = settings.turn_timeout_seconds
         if isolated:
             # Claude's SDK can expose an empty tool set. Codex's CLI does not
@@ -178,28 +185,116 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         response_id = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
 
+        async def upload_url(event: Image) -> str | None:
+            # Prefer Open WebUI's file store (small messages, owned by Open WebUI);
+            # any problem falls back to inline base64 so the image is never lost.
+            config = profile.openwebui
+            token = os.environ.get(config.api_key_env, "") if config else ""
+            if not (config and config.upload_images and token):
+                return None
+            try:
+                return await OpenWebUIClient(config, token).upload_image(
+                    event.data, event.mime_type
+                )
+            except ToolError as exc:
+                logger.warning("Open WebUI image upload failed; using inline image: %s", exc)
+                return None
+
+        async def render(event: Text | Image) -> str:
+            if isinstance(event, Text):
+                return event.content
+            alt = "".join(c for c in (event.alt or "Generated image")[:500] if ord(c) >= 32)
+            for char in "\\[]!<>`":
+                alt = alt.replace(char, "\\" + char)
+            validate_image(event.data, event.mime_type)
+            url = await upload_url(event)
+            if url is None:
+                url = f"data:{event.mime_type};base64," + base64.b64encode(event.data).decode()
+            return f"\n\n![{alt}]({url})\n\n"
+
+        async def fetch_uploaded_images() -> dict[str, tuple[bytes, str]]:
+            # Only same-origin Open WebUI file links are fetched, via the profile's own
+            # connection. Failures leave the link as text instead of failing the turn.
+            config = profile.openwebui
+            token = os.environ.get(config.api_key_env, "") if config else ""
+            ids = uploaded_image_ids(messages)[:20]
+            if not (config and token and ids):
+                return {}
+            client = OpenWebUIClient(config, token)
+            files = {}
+            for file_id in ids:
+                try:
+                    files[file_id] = await client.download_image(file_id)
+                except ToolError as exc:
+                    logger.warning("Could not load stored image for replay: %s", exc)
+            return files
+
+        async def prepare_turn():
+            store = request.app.state.store
+            row = store.get(key) if key else None
+            if key and message_ids.get("parent_known"):
+                parent = message_ids.get("parent_message_id")
+                row = store.get_branch(key, parent) if parent else None
+            resume = None
+            if (
+                row
+                and row["cwd"] == str(profile.cwd)
+                and row["prefix_hash"] == digest(messages[:-1])
+                and not (
+                    message_ids.get("user_message_id")
+                    and message_ids["user_message_id"] == row["user_message_id"]
+                )
+                and not (
+                    message_ids.get("assistant_message_id")
+                    and message_ids["assistant_message_id"] == row["assistant_message_id"]
+                )
+            ):
+                resume = row["session_id"]
+            if resume:
+                prompt = messages[-1]["content"]
+            else:
+                prompt = replay(messages, await fetch_uploaded_images())
+            if key:
+                if resume:
+                    store.invalidate_session(key, resume)
+                store.delete(key)
+            return prompt, resume
+
+        def save_turn(result, rendered):
+            if key:
+                prefix = messages + [{"role": "assistant", "content": "".join(rendered)}]
+                request.app.state.store.save(
+                    key, result.session_id, str(profile.cwd), digest(prefix), **message_ids
+                )
+
         if not body.stream:
 
             async def collect():
+                if key:
+                    async with locks.hold(key):
+                        return await collect_turn()
+                return await collect_turn()
+
+            async def collect_turn():
+                prompt, resume = await prepare_turn()
                 rendered = []
                 result = None
                 async with (
                     asyncio.timeout(timeout),
-                    aclosing(
-                        backends[profile.backend].stream(profile, replay(messages), None)
-                    ) as events,
+                    aclosing(backends[profile.backend].stream(profile, prompt, resume)) as events,
                 ):
                     async for event in events:
-                        if isinstance(event, Text):
+                        if isinstance(event, (Text, Image)):
                             if result is not None:
                                 raise RuntimeError("Backend emitted text after its result")
-                            rendered.append(event.content)
+                            rendered.append(await render(event))
                         elif isinstance(event, Done):
                             if result is not None:
                                 raise RuntimeError("Backend emitted duplicate results")
                             result = event
                 if result is None:
                     raise RuntimeError("Backend did not return a result")
+                save_turn(result, rendered)
                 response = {
                     "id": response_id,
                     "object": "chat.completion",
@@ -242,7 +337,12 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - translate arbitrary backend failures
                 logger.warning("Isolated completion failed (%s)", type(exc).__name__)
                 return JSONResponse(
-                    error_payload("Isolated completion failed; retry the request", "server_error"),
+                    error_payload(
+                        str(exc)
+                        if isinstance(exc, ImageDeliveryError)
+                        else "Isolated completion failed; retry the request",
+                        "server_error",
+                    ),
                     status_code=504 if isinstance(exc, TimeoutError) else 502,
                 )
             finally:
@@ -270,35 +370,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             )
 
         async def run_turn():
-            store = request.app.state.store
-            row = store.get(key) if key else None
-            if key and message_ids.get("parent_known"):
-                parent = message_ids.get("parent_message_id")
-                # Explicit empty parent means root, while absent means legacy
-                # clients can continue using the last-session/hash behavior.
-                row = store.get_branch(key, parent) if parent else None
-            resume = None
-            if (
-                row
-                and row["cwd"] == str(profile.cwd)
-                and row["prefix_hash"] == digest(messages[:-1])
-                and not (
-                    message_ids.get("user_message_id")
-                    and message_ids["user_message_id"] == row["user_message_id"]
-                )
-                and not (
-                    message_ids.get("assistant_message_id")
-                    and message_ids["assistant_message_id"] == row["assistant_message_id"]
-                )
-            ):
-                resume = row["session_id"]
-            prompt = messages[-1]["content"] if resume else replay(messages)
-            if key:
-                if resume:
-                    store.invalidate_session(key, resume)
-                # Clear the last-turn pointer, preserving independent native
-                # sessions on other branches when this turn starts fresh.
-                store.delete(key)
+            prompt, resume = await prepare_turn()
             queue: asyncio.Queue = asyncio.Queue(maxsize=64)
 
             async def produce():
@@ -332,22 +404,19 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                         break
                     if isinstance(event, Exception):
                         raise event
-                    if isinstance(event, Text):
+                    if isinstance(event, (Text, Image)):
                         if result is not None:
                             raise RuntimeError("Backend emitted text after its result")
-                        rendered.append(event.content)
-                        yield chunk({"content": event.content})
+                        content = await render(event)
+                        rendered.append(content)
+                        yield chunk({"content": content})
                     elif isinstance(event, Done):
                         if result is not None:
                             raise RuntimeError("Backend emitted duplicate results")
                         result = event
                 if result is None:
                     raise RuntimeError("Backend did not return a session")
-                if key:
-                    prefix = messages + [{"role": "assistant", "content": "".join(rendered)}]
-                    store.save(
-                        key, result.session_id, str(profile.cwd), digest(prefix), **message_ids
-                    )
+                save_turn(result, rendered)
                 yield chunk({}, finish="stop")
                 if (
                     body.stream_options
@@ -360,10 +429,13 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                         usage=usage_payload(result.usage),
                     )
                 yield "data: [DONE]\n\n"
-            except Exception:  # noqa: BLE001 - HTTP headers are already sent; report via SSE
+            except Exception as exc:  # noqa: BLE001 - HTTP headers are already sent; report via SSE
                 yield sse(
                     error_payload(
-                        "Agent turn failed; retry to start a fresh session", "server_error"
+                        str(exc)
+                        if isinstance(exc, ImageDeliveryError)
+                        else "Agent turn failed; retry to start a fresh session",
+                        "server_error",
                     )
                 )
                 yield "data: [DONE]\n\n"

@@ -22,6 +22,7 @@ task_timeout_seconds = 60
 # notes_write = false # Requires notes=true; enables create/update/delete.
 # chat_history = false # Enable read-only search and reading of past chats.
 # knowledge_ids = [] # All bases accessible to the configured account.
+# upload_images = true # Store generated images in Open WebUI; false forces inline base64.
 # timeout_seconds = 30
 
 # Optional upstream MCP tools through the same stdio adapter (shared by profiles).

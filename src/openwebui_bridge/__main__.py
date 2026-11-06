@@ -19,7 +19,9 @@ def main():
     proxy_logger.addHandler(handler)
     proxy_logger.setLevel(logging.INFO)
     proxy_logger.propagate = False
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, workers=1)
+    uvicorn.run(
+        create_app(settings), host=settings.host, port=settings.port, workers=1, access_log=False
+    )
 
 
 if __name__ == "__main__":

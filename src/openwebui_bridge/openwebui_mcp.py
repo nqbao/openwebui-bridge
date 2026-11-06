@@ -21,6 +21,7 @@ from mcp.types import PaginatedRequestParams, ToolAnnotations
 from pydantic import Field, TypeAdapter
 
 from .config import OpenWebUIConfig, RemoteMCPConfig, load_settings, normalize_memory_path
+from .images import MAX_IMAGE_BYTES, ImageDeliveryError, validate_image
 
 CONFIG_ENV = "OPENWEBUI_BRIDGE_CONFIG"
 TOKEN_ENV = "OPENWEBUI_BRIDGE_TOKEN"
@@ -206,6 +207,51 @@ class OpenWebUIClient:
             ) from None
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ToolError(f"{self.service} returned an invalid JSON response") from None
+
+    async def upload_image(self, data: bytes, mime_type: str) -> str:
+        """Upload a validated image to Open WebUI and return its same-origin content URL."""
+        extension = mime_type.removeprefix("image/").replace("jpeg", "jpg")
+        result = await self.request(
+            "POST",
+            "files/",
+            params={"process": "false"},
+            files={"file": (f"generated.{extension}", data, mime_type)},
+        )
+        file_id = result.get("id") if isinstance(result, dict) else None
+        if not isinstance(file_id, str):
+            raise ToolError(f"{self.service} returned an invalid file response")
+        return f"/api/v1/files/{identifier(file_id)}/content"
+
+    async def download_image(self, file_id: str) -> tuple[bytes, str]:
+        """Fetch an image previously uploaded to Open WebUI, validated and size-limited."""
+        try:
+            async with (
+                httpx.AsyncClient(
+                    timeout=self.config.timeout_seconds,
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=self.transport,
+                ) as client,
+                client.stream(
+                    "GET",
+                    self.config.url.rstrip("/")
+                    + f"{self.api_prefix}files/{identifier(file_id)}/content",
+                    headers={"Authorization": "Bearer " + self.token},
+                ) as response,
+            ):
+                if not response.is_success:
+                    raise ToolError(f"{self.service} returned HTTP {response.status_code}")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_IMAGE_BYTES:
+                        raise ToolError("Stored image exceeds the 10 MiB payload limit")
+        except httpx.HTTPError:
+            raise ToolError(f"Cannot reach {self.service}") from None
+        try:
+            return bytes(body), validate_image(bytes(body))
+        except ImageDeliveryError as exc:
+            raise ToolError(str(exc)) from None
 
     async def knowledge(self, knowledge_id: str):
         identifier(knowledge_id)
