@@ -2,12 +2,15 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .images import ImageDeliveryError, decode_image
+
+logger = logging.getLogger(__name__)
 
 
 class TextPart(BaseModel):
@@ -76,12 +79,9 @@ class Message(BaseModel):
     model_config = ConfigDict(extra="ignore")
     role: Literal["system", "developer", "user", "assistant"]
     content: str | list[ContentPart]
-    tool_calls: list[dict] | None = None
 
     @model_validator(mode="after")
-    def no_client_tools(self):
-        if self.tool_calls:
-            raise ValueError("Client tool calls are unsupported; the agent manages tools")
+    def supported_content(self):
         if (
             self.role != "user"
             and isinstance(self.content, list)
@@ -118,6 +118,42 @@ class CompletionRequest(BaseModel):
     functions: list[dict] | None = None
     response_format: dict | None = None
     stream_options: dict | None = None
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def ignore_client_tool_history(cls, messages):
+        if not isinstance(messages, list):
+            return messages
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") != "user":
+            raise ValueError("The transcript must end with a user message")
+        cleaned = []
+        calls = replies = 0
+        for message in messages:
+            if isinstance(message, dict):
+                if message.get("role") in ("tool", "function"):
+                    replies += 1
+                    continue
+                if message.get("role") == "assistant" and (
+                    message.get("tool_calls") or message.get("function_call")
+                ):
+                    calls += 1
+                    message = {
+                        key: value
+                        for key, value in message.items()
+                        if key not in ("tool_calls", "function_call")
+                    }
+                    # Tool-only assistant messages often omit content or use null.
+                    if message.get("content") in (None, "", []):
+                        continue
+            cleaned.append(message)
+        if calls or replies:
+            logger.warning(
+                "Ignoring client tool history: %s call messages, %s replies; "
+                "the agent manages tools",
+                calls,
+                replies,
+            )
+        return cleaned
 
     @model_validator(mode="after")
     def supported_request(self):

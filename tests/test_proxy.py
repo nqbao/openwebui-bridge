@@ -453,6 +453,68 @@ async def test_unsupported_requests_fail_before_agent_runs(tmp_path, fields):
         assert backend.calls == []
 
 
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("content", [None, "Checking now", [], "omitted"])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_model_switch_ignores_tool_history(tmp_path, caplog, stream, content, legacy):
+    call = {"role": "assistant"}
+    if content != "omitted":
+        call["content"] = content
+    if legacy:
+        call["function_call"] = {"name": "private_tool", "arguments": "private_args"}
+    else:
+        call["tool_calls"] = [
+            {
+                "id": "private_id",
+                "type": "function",
+                "function": {"name": "private_tool", "arguments": "private_args"},
+            }
+        ]
+    history = [
+        msg("user", "first"),
+        call,
+        {"role": "function" if legacy else "tool", "content": "private_result"},
+        msg("assistant", "answer"),
+        msg("user", "continue"),
+    ]
+    original = json.dumps(history)
+    async with client_for(tmp_path) as (client, backend, _):
+        await complete(client, [msg("user", "first")])
+        response = await complete(client, history, model="claude-code:other", stream=stream)
+        assert response.status_code == 200
+        prompt, resume = backend.calls[-1][1:]
+        assert resume is None
+        expected = [msg("user", "first")]
+        if content == "Checking now":
+            expected.append(msg("assistant", content))
+        expected += [msg("assistant", "answer"), msg("user", "continue")]
+        assert json.loads(prompt.split("JSON:\n", 1)[1]) == expected
+        warnings = [r for r in caplog.records if "Ignoring client tool history" in r.message]
+        assert len(warnings) == 1
+        assert "1 call messages, 1 replies" in warnings[0].message
+        assert "private_" not in caplog.text
+        assert json.dumps(history) == original
+        if stream:
+            history += [msg("assistant", "answer"), msg("user", "next")]
+            await complete(client, history, model="claude-code:other")
+            assert backend.calls[-1][1:] == ("next", "session-2")
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        [{"role": "tool", "content": "ignored"}],
+        [msg("user", "hi"), {"role": "assistant", "tool_calls": [{}]}],
+        [msg("invalid", "bad"), msg("user", "hi")],
+    ],
+)
+async def test_tool_history_still_requires_valid_user_turn(tmp_path, history):
+    async with client_for(tmp_path) as (client, backend, _):
+        response = await complete(client, history)
+        assert response.status_code == 400
+        assert backend.calls == []
+
+
 async def test_nonstreaming_completion_is_tool_free_and_preserves_session(tmp_path):
     async with client_for(tmp_path, api_key="private-api-key") as (client, backend, _):
         client.headers["Authorization"] = "Bearer private-api-key"

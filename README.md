@@ -103,6 +103,11 @@ if you only want to authenticate Codex.
 Profiles load `CLAUDE.md` or `AGENTS.md` from their project. Add
 `project_instructions = false` to a profile to disable this.
 
+You can switch an existing chat to a bridge model even if its history contains
+tool calls from another model. The bridge keeps assistant text, discards client
+tool calls and tool replies, and logs a warning. The new agent will not see those
+tool results; ask it to fetch any needed information again.
+
 ## Attach an image
 
 In Open WebUI, open **Workspace → Models**, edit your profile's model, and enable
