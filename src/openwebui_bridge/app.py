@@ -17,7 +17,7 @@ from .backends import ClaudeBackend, CodexBackend, Done, Image, Text
 from .config import Profile, Settings
 from .images import ImageDeliveryError, validate_image
 from .openwebui_mcp import OpenWebUIClient, connection_env
-from .protocol import CompletionRequest, digest, replay, uploaded_image_ids
+from .protocol import CompletionRequest, digest, replay, session_digest, uploaded_image_ids
 from .store import ChatLocks, Store
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,23 @@ def task_label(request: Request) -> str:
         "voice_mode_prompt_generation",
     }
     return task if task in known else "other"
+
+
+def history_fingerprints(messages: list[dict]) -> list[dict]:
+    # Compare requests without retaining or logging conversation text. A second
+    # hash helps distinguish whitespace trimming from other content changes.
+    return [
+        {
+            "index": index,
+            "role": message["role"],
+            "chars": len(message["content"]) if isinstance(message["content"], str) else None,
+            "hash": digest(message)[:12],
+            "trimmed_hash": digest({**message, "content": message["content"].strip()})[:12]
+            if isinstance(message["content"], str)
+            else None,
+        }
+        for index, message in enumerate(messages)
+    ]
 
 
 def error_payload(message: str, kind: str = "invalid_request_error") -> dict:
@@ -144,7 +161,9 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 "persist memory. You are not working on a repository task.",
             )
             timeout = settings.task_timeout_seconds
-            logger.info("Isolated completion: stream=%s; task=%s", body.stream, task_label(request))
+            logger.debug(
+                "Isolated completion: stream=%s; task=%s", body.stream, task_label(request)
+            )
         messages = [message.canonical() for message in body.messages]
         try:
             # Changing the configured API identity must not reuse another user's
@@ -184,6 +203,22 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             message_ids["parent_known"] = "x-openwebui-user-message-parent-id" in request.headers
         response_id = "chatcmpl-" + uuid.uuid4().hex
         created = int(time.time())
+        persistence_reason = (
+            "isolated_task" if isolated else "missing_chat_id" if not chat_id else "enabled"
+        )
+        logger.debug(
+            "Session request: request=%s; backend=%s; stream=%s; chat_id_present=%s; "
+            "user_id_present=%s; task_header=%s; task=%s; persistence=%s; key=%s",
+            response_id,
+            profile.backend,
+            body.stream,
+            bool(chat_id),
+            "x-openwebui-user-id" in request.headers,
+            "missing" if task_header is None else "nonempty" if task_header else "empty",
+            task_label(request),
+            persistence_reason,
+            key[:12] if key else "none",
+        )
 
         async def upload_url(event: Image) -> str | None:
             # Prefer Open WebUI's file store (small messages, owned by Open WebUI);
@@ -236,20 +271,50 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 parent = message_ids.get("parent_message_id")
                 row = store.get_branch(key, parent) if parent else None
             resume = None
-            if (
-                row
-                and row["cwd"] == str(profile.cwd)
-                and row["prefix_hash"] == digest(messages[:-1])
-                and not (
-                    message_ids.get("user_message_id")
-                    and message_ids["user_message_id"] == row["user_message_id"]
-                )
-                and not (
-                    message_ids.get("assistant_message_id")
-                    and message_ids["assistant_message_id"] == row["assistant_message_id"]
-                )
+            if not key:
+                reason = persistence_reason
+            elif not row:
+                reason = "no_branch_mapping" if message_ids.get("parent_known") else "no_mapping"
+            elif row["cwd"] != str(profile.cwd):
+                reason = "cwd_changed"
+            elif row["prefix_hash"] != session_digest(messages[:-1]):
+                reason = "history_mismatch"
+            elif (
+                message_ids.get("user_message_id")
+                and message_ids["user_message_id"] == row["user_message_id"]
             ):
+                reason = "duplicate_user_message_id"
+            elif (
+                message_ids.get("assistant_message_id")
+                and message_ids["assistant_message_id"] == row["assistant_message_id"]
+            ):
+                reason = "duplicate_assistant_message_id"
+            else:
+                reason = "history_match"
                 resume = row["session_id"]
+            if not isolated:
+                logger.info(
+                    "Session: %s %s (%s)",
+                    profile.backend,
+                    "resume" if resume else "new",
+                    reason,
+                )
+            logger.debug(
+                "Session decision: request=%s; action=%s; reason=%s; session_ref=%s",
+                response_id,
+                "resume" if resume else "new",
+                reason,
+                digest(resume)[:12] if resume else "none",
+            )
+            if reason == "history_mismatch" and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Session history: request=%s; source=incoming; expected_hash=%s; "
+                    "actual_hash=%s; messages=%s",
+                    response_id,
+                    row["prefix_hash"][:12],
+                    session_digest(messages[:-1])[:12],
+                    json.dumps(history_fingerprints(messages[:-1])),
+                )
             if resume:
                 prompt = messages[-1]["content"]
             else:
@@ -264,8 +329,22 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             if key:
                 prefix = messages + [{"role": "assistant", "content": "".join(rendered)}]
                 request.app.state.store.save(
-                    key, result.session_id, str(profile.cwd), digest(prefix), **message_ids
+                    key, result.session_id, str(profile.cwd), session_digest(prefix), **message_ids
                 )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Session history: request=%s; source=saved; hash=%s; messages=%s",
+                        response_id,
+                        session_digest(prefix)[:12],
+                        json.dumps(history_fingerprints(prefix)),
+                    )
+            logger.debug(
+                "Session completed: request=%s; mapping=%s; reason=%s; session_ref=%s",
+                response_id,
+                "saved" if key else "skipped",
+                "persistence_enabled" if key else persistence_reason,
+                digest(result.session_id)[:12],
+            )
 
         if not body.stream:
 

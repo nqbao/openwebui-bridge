@@ -1,3 +1,5 @@
+import json
+import logging
 import sqlite3
 from contextlib import asynccontextmanager
 
@@ -26,7 +28,14 @@ async def bridge(tmp_path, backend_name="claude"):
 
 
 async def turn(
-    client, messages, user_id=None, assistant_id=None, parent=None, parent_known=True, **headers
+    client,
+    messages,
+    user_id=None,
+    assistant_id=None,
+    parent=None,
+    parent_known=True,
+    stream=True,
+    **headers,
 ):
     headers = {"X-OpenWebUI-Chat-Id": "chat", "X-OpenWebUI-User-Id": "user", **headers}
     if user_id:
@@ -38,7 +47,7 @@ async def turn(
     return await client.post(
         "/v1/chat/completions",
         headers=headers,
-        json={"model": "test", "messages": messages, "stream": True},
+        json={"model": "test", "messages": messages, "stream": stream},
     )
 
 
@@ -104,6 +113,74 @@ async def test_hashes_and_duplicate_ids_prevent_wrong_resume(tmp_path, change):
             "a1",
         )
         assert backend.calls[-1][2] is None
+
+
+@pytest.mark.parametrize("backend_name", ["claude", "codex"])
+@pytest.mark.parametrize("stream", [True, False])
+async def test_trimmed_assistant_history_resumes(tmp_path, backend_name, stream):
+    async with bridge(tmp_path, backend_name) as (client, backend, _):
+        backend.content = "\n\nanswer\n\n"
+        first = [msg("user", "first")]
+        headers = {"X-OpenWebUI-Task": ""}
+        await turn(client, first, "u1", "a1", stream=stream, **headers)
+        second = first + [msg("assistant", "answer"), msg("user", "second")]
+        await turn(client, second, "u2", "a2", "a1", stream=stream, **headers)
+        assert backend.calls[-1][1:] == ("second", "session-1")
+        third = second + [msg("assistant", "answer"), msg("user", "third")]
+        await turn(client, third, "u3", "a3", "a2", stream=stream, **headers)
+        assert backend.calls[-1][1:] == ("third", "session-2")
+
+
+@pytest.mark.parametrize(
+    "role,original,edited",
+    [
+        ("user", "first", "first\n"),
+        ("system", "instructions", " instructions"),
+        ("developer", "instructions", "instructions "),
+        ("assistant", "first answer\n", "first  answer"),
+        ("assistant", "first answer\n", "changed answer"),
+    ],
+)
+async def test_other_history_changes_still_prevent_resume(tmp_path, role, original, edited):
+    async with bridge(tmp_path) as (client, backend, _):
+        first = [msg(role, original)] if role != "assistant" else []
+        if role != "user":
+            first.append(msg("user", "first"))
+        backend.content = original if role == "assistant" else "answer\n\n"
+        await turn(client, first, "u1", "a1")
+        second = first + [msg("assistant", backend.content.strip()), msg("user", "second")]
+        index = len(first) if role == "assistant" else 0
+        second[index] = msg(role, edited)
+        await turn(client, second, "u2", "a2", "a1")
+        assert backend.calls[-1][2] is None
+
+
+async def test_history_diagnostics_locate_changed_reply_without_logging_text(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="openwebui_bridge.app")
+    async with bridge(tmp_path) as (client, backend, _):
+        backend.content = "private-answer\n\n"
+        first = [msg("system", "private-system"), msg("user", "private-question")]
+        await turn(client, first, "u1", "a1")
+        second = first + [
+            msg("assistant", "private-edited-answer"),
+            msg("user", "private-followup"),
+        ]
+        await turn(client, second, "u2", "a2", "a1")
+        histories = [
+            json.loads(record.getMessage().split("; messages=", 1)[1])
+            for record in caplog.records
+            if record.getMessage().startswith("Session history:")
+        ]
+        saved, incoming, _ = histories
+        assert saved[:2] == incoming[:2]
+        assert saved[2]["role"] == incoming[2]["role"] == "assistant"
+        assert saved[2]["chars"] == len(backend.content)
+        assert incoming[2]["chars"] == len("private-edited-answer")
+        assert saved[2]["hash"] != incoming[2]["hash"]
+        assert saved[2]["trimmed_hash"] != incoming[2]["trimmed_hash"]
+        assert "reason=history_mismatch" in caplog.text
+        assert backend.calls[-1][2] is None  # Diagnostics never relax resume checks.
+        assert "private-" not in caplog.text
 
 
 async def test_failed_resume_invalidates_branch_reference(tmp_path):

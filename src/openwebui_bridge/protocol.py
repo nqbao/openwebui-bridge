@@ -149,6 +149,20 @@ def digest(value: object) -> str:
     ).hexdigest()
 
 
+def session_digest(messages: list[dict]) -> str:
+    # Open WebUI trims assistant replies before forwarding them as history.
+    # Normalize only their outer whitespace for session comparison; preserve
+    # user/system content, internal whitespace, and the actual replay payload.
+    return digest(
+        [
+            {**message, "content": message["content"].strip()}
+            if message["role"] == "assistant" and isinstance(message["content"], str)
+            else message
+            for message in messages
+        ]
+    )
+
+
 _IMAGE_MARKDOWN = re.compile(
     r"!\[(?:\\.|[^\]\\])*\]\("
     r"(?:(data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)"
