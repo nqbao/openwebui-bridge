@@ -25,7 +25,7 @@ from openwebui_bridge.images import (
     decode_image,
 )
 from openwebui_bridge.openwebui_mcp import OpenWebUIClient
-from openwebui_bridge.protocol import digest, replay, uploaded_image_ids
+from openwebui_bridge.protocol import replay, session_digest, uploaded_image_ids
 
 
 def png(color="green"):
@@ -260,7 +260,7 @@ async def test_images_render_inline_and_persist_exactly(tmp_path, stream):
         assert "data:image/png;base64," + base64.b64encode(png()).decode() in content
         assert "https://" not in content
         saved = app.state.store.db.execute("SELECT prefix_hash FROM sessions").fetchone()[0]
-        assert saved == digest(messages + [{"role": "assistant", "content": content}])
+        assert saved == session_digest(messages + [{"role": "assistant", "content": content}])
         history = messages + [
             {"role": "assistant", "content": content},
             {"role": "user", "content": "Make it blue"},
@@ -347,7 +347,7 @@ async def test_images_upload_to_openwebui_by_default(tmp_path, monkeypatch, stre
         assert uploads == [(png(), "image/png")]
         assert "(/api/v1/files/abc-123/content)" in content and "data:image" not in content
         saved = app.state.store.db.execute("SELECT prefix_hash FROM sessions").fetchone()[0]
-        assert saved == digest(messages + [{"role": "assistant", "content": content}])
+        assert saved == session_digest(messages + [{"role": "assistant", "content": content}])
 
 
 @pytest.mark.parametrize("failure", ["upload", "no_key", "disabled"])
