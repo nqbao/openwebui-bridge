@@ -39,3 +39,16 @@ def test_missing_dotenv_does_not_search_parent_directories(tmp_path, monkeypatch
 
     assert load_settings(path).api_key is None
     assert "BRIDGE_TEST_PARENT_KEY" not in os.environ
+
+
+def test_openwebui_url_expands_environment_variable(tmp_path, monkeypatch):
+    path = tmp_path / "profiles.toml"
+    path.write_text(
+        '[openwebui]\nurl = "${BRIDGE_TEST_WEBUI_URL}"\n[profiles.test]\ncwd = "."\n'
+    )
+    (tmp_path / ".env").write_text("BRIDGE_TEST_WEBUI_URL=http://webui.test:3000\n")
+    monkeypatch.delenv("BRIDGE_TEST_WEBUI_URL", raising=False)
+
+    settings = load_settings(path)
+
+    assert settings.profiles["test"].openwebui.url == "http://webui.test:3000"

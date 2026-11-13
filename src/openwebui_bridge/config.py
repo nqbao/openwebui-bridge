@@ -110,6 +110,12 @@ class OpenWebUIConfig(BaseModel):
     upload_images: bool = True
     timeout_seconds: float = Field(default=30, gt=0, le=120)
 
+    @field_validator("url", mode="before")
+    @classmethod
+    def expand_url_env(cls, value):
+        # Allow url = "${OPENWEBUI_URL}" so the base URL can live in .env.
+        return os.path.expandvars(value) if isinstance(value, str) else value
+
     @field_validator("memory_path")
     @classmethod
     def valid_memory_path(cls, value):
