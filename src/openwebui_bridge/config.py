@@ -251,9 +251,29 @@ def load_settings(path: Path) -> Settings:
     api_key_env = server.pop("api_key_env", "PROXY_API_KEY")
     server["api_key"] = os.environ.get(api_key_env) or None
     server["database"] = (path.parent / server.get("database", ".state/sessions.sqlite3")).resolve()
-    profiles = raw.get("profiles", {})
-    if not profiles:
+    raw_profiles = raw.get("profiles", {})
+    if not raw_profiles:
         raise ValueError("Configure at least one profile")
+    resolved_profiles: dict[str, dict] = {}
+
+    def resolve_profile(name: str, ancestors: tuple[str, ...] = ()) -> dict:
+        if name in ancestors:
+            chain = " -> ".join((*ancestors, name))
+            raise ValueError(f"Profile inheritance cycle: {chain}")
+        if name not in resolved_profiles:
+            profile = raw_profiles[name]
+            if not isinstance(profile, dict):
+                raise ValueError(f"Profile {name!r} must be a table")
+            profile = profile.copy()
+            if "extends" in profile:
+                parent = profile.pop("extends")
+                if not isinstance(parent, str) or parent not in raw_profiles:
+                    raise ValueError(f"Profile {name!r} extends unknown profile {parent!r}")
+                profile = {**resolve_profile(parent, (*ancestors, name)), **profile}
+            resolved_profiles[name] = profile
+        return resolved_profiles[name]
+
+    profiles = {name: resolve_profile(name) for name in raw_profiles}
     shared_openwebui = raw.get("openwebui")
     if shared_openwebui is not None:
         shared_openwebui = OpenWebUIConfig.model_validate(shared_openwebui).model_dump()

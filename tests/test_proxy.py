@@ -729,6 +729,50 @@ def test_config_paths_and_read_only_enforcement(tmp_path):
         Profile(cwd=tmp_path, permission_mode="bypassPermissions")
 
 
+def test_profile_inheritance_resolves_before_validation(tmp_path):
+    path = tmp_path / "profiles.toml"
+    path.write_text("""
+[profiles.opus]
+extends = "sonnet"
+model = "opus"
+
+[profiles.sonnet]
+extends = "base"
+model = "sonnet"
+allowed_tools = ["Read"]
+
+[profiles.base]
+cwd = "."
+allowed_tools = ["Read", "Glob"]
+system_prompt = "Shared instructions"
+openwebui = false
+""")
+    profiles = load_settings(path).profiles
+    assert profiles["opus"].model_dump() == {**profiles["sonnet"].model_dump(), "model": "opus"}
+    assert profiles["opus"].cwd == tmp_path
+    assert profiles["opus"].system_prompt == "Shared instructions"
+    assert profiles["opus"].allowed_tools == ["Read"]
+    assert profiles["base"].allowed_tools == ["Read", "Glob"]
+
+
+@pytest.mark.parametrize(
+    "parent, error",
+    [("missing", "extends unknown profile 'missing'"), ("child", "inheritance cycle")],
+)
+def test_invalid_profile_inheritance(tmp_path, parent, error):
+    path = tmp_path / "profiles.toml"
+    path.write_text(f'[profiles.child]\nextends = "{parent}"\n')
+    with pytest.raises(ValueError, match=error):
+        load_settings(path)
+
+
+def test_profile_must_be_a_table(tmp_path):
+    path = tmp_path / "profiles.toml"
+    path.write_text('[profiles]\nchild = "sonnet"\n')
+    with pytest.raises(ValueError, match="Profile 'child' must be a table"):
+        load_settings(path)
+
+
 def test_database_lease_blocks_second_process(tmp_path):
     store = Store(tmp_path / "sessions.db")
     try:

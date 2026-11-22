@@ -76,6 +76,18 @@ allowed_tools = ["Read", "Glob", "Grep"]
 system_prompt = "Help the user understand this repository."
 ```
 
+Use `extends` to reuse another profile's settings and override individual fields.
+Each field set in the child replaces the inherited field, including lists and
+tables. Chains can be several levels deep; an unknown parent or a cycle is a
+configuration error. Each profile has its own session identity. Switching
+profiles in a chat replays the conversation in a fresh backend session.
+
+```toml
+[profiles."claude-code:myrepo-opus"]
+extends = "claude-code:myrepo"
+model = "opus"
+```
+
 To let Claude edit files and run commands, change that profile's `allowed_tools`:
 
 ```toml

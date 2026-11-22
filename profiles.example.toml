@@ -45,6 +45,12 @@ project_instructions = true # Load CLAUDE.md from cwd; false ignores it.
 # allowed_tools = ["Read", "Glob", "Grep", "mcp__myserver"] # or "mcp__myserver__tool"
 max_turns = 30
 
+# Optional: derive a model from another profile. Fields set here replace the
+# inherited ones, and each profile keeps its own backend session.
+# [profiles."claude-code:myrepo-opus"]
+# extends = "claude-code:myrepo"
+# model = "opus"
+
 # Optional profile overrides. Other settings inherit from [openwebui].
 # Without shared defaults, include url here to enable just this profile.
 # [profiles."claude-code:myrepo".openwebui]
