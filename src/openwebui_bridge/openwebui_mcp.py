@@ -21,6 +21,14 @@ from mcp.types import PaginatedRequestParams, ToolAnnotations
 from pydantic import Field, TypeAdapter
 
 from .config import OpenWebUIConfig, RemoteMCPConfig, load_settings, normalize_memory_path
+from .file_delivery import (
+    MAX_FILE_BYTES,
+    download_env,
+    download_url,
+    read_file,
+    record_download,
+    valid_filename,
+)
 from .images import MAX_IMAGE_BYTES, ImageDeliveryError, validate_image
 
 CONFIG_ENV = "OPENWEBUI_BRIDGE_CONFIG"
@@ -84,6 +92,16 @@ def build_instructions(config: OpenWebUIConfig | None, upstream: bool = False) -
                 parts.append(_NOTES_WRITE)
         if config.chat_history:
             parts.append(_CHAT_HISTORY)
+        if config.send_files:
+            parts.append(
+                "Use send_file when the user requests a downloadable file. For text, pass a "
+                "filename and the complete text. The bridge adds the download link after success."
+            )
+            if config.file_output_dir:
+                parts.append(
+                    f"To send a binary file, put it in {config.file_output_dir} and call send_file "
+                    "with its filename."
+                )
     if upstream:
         parts.append(_UPSTREAM)
     return " ".join(parts)
@@ -100,6 +118,8 @@ def connection_env(
     if config and config.tool_names() and not token:
         raise ValueError(f"Set the Open WebUI API key environment variable {config.api_key_env}")
     environment = {CONFIG_ENV: config.model_dump_json() if config else "null", TOKEN_ENV: token}
+    if config and config.send_files:
+        environment.update(download_env())
     tokens = {}
     for name, upstream in mcp_servers.items():
         gateway_token = os.environ.get(upstream.api_key_env) if upstream.api_key_env else ""
@@ -211,16 +231,21 @@ class OpenWebUIClient:
     async def upload_image(self, data: bytes, mime_type: str) -> str:
         """Upload a validated image to Open WebUI and return its same-origin content URL."""
         extension = mime_type.removeprefix("image/").replace("jpeg", "jpg")
+        file_id = await self.upload_file(f"generated.{extension}", data, mime_type)
+        return f"/api/v1/files/{file_id}/content"
+
+    async def upload_file(self, filename: str, data: bytes, mime_type: str) -> str:
+        """Store a download in Open WebUI and return its validated file ID."""
         result = await self.request(
             "POST",
             "files/",
             params={"process": "false"},
-            files={"file": (f"generated.{extension}", data, mime_type)},
+            files={"file": (filename, data, mime_type)},
         )
         file_id = result.get("id") if isinstance(result, dict) else None
         if not isinstance(file_id, str):
             raise ToolError(f"{self.service} returned an invalid file response")
-        return f"/api/v1/files/{identifier(file_id)}/content"
+        return identifier(file_id)
 
     async def download_image(self, file_id: str) -> tuple[bytes, str]:
         """Fetch an image previously uploaded to Open WebUI, validated and size-limited."""
@@ -424,6 +449,30 @@ def create_server(
     )
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
     write = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+
+    if config and config.send_files:
+
+        @server.tool(annotations=write)
+        async def send_file(filename: str, text: str | None = None) -> dict:
+            """Send a downloadable file to this chat. Provide text, or name a file in the output directory."""
+            if not valid_filename(filename):
+                raise ToolError("Use a plain filename without a directory.")
+            if text is None:
+                if config.file_output_dir is None:
+                    raise ToolError("Provide text to send a file with this profile.")
+                try:
+                    data = read_file(config.file_output_dir, filename, MAX_FILE_BYTES)
+                except ValueError as exc:
+                    raise ToolError(str(exc)) from None
+                except OSError:
+                    raise ToolError("Could not open that file in the output directory.") from None
+            else:
+                data = text.encode()
+                if len(data) > MAX_FILE_BYTES:
+                    raise ToolError("The file exceeds the size limit.")
+            file_id = await api.upload_file(filename, data, "application/octet-stream")
+            record_download(file_id, filename)
+            return {"filename": filename, "url": download_url(file_id)}
 
     if config and config.knowledge:
 

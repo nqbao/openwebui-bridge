@@ -19,6 +19,7 @@ from .config import (
     split_mcp_pattern,
     tool_base,
 )
+from .file_delivery import DOWNLOADS_ENV
 from .images import MAX_EVENT_BYTES, ImageDeliveryError, decode_image
 from .openwebui_mcp import (
     CONFIG_ENV,
@@ -400,6 +401,7 @@ def codex_command(
         config = {
             **server_command(),
             "env_vars": [CONFIG_ENV, TOKEN_ENV]
+            + ([DOWNLOADS_ENV] if profile.openwebui and profile.openwebui.send_files else [])
             + ([MCP_CONFIG_ENV, MCP_TOKENS_ENV] if profile.mcp_servers else []),
             "enabled_tools": (profile.openwebui.tool_names() if profile.openwebui else [])
             + (gateway_tools or []),
@@ -433,6 +435,8 @@ def codex_command(
         if profile.openwebui and profile.openwebui.notes_write:
             for tool in ("create_note", "update_note", "delete_note"):
                 command += ["-c", f'mcp_servers.openwebui.tools.{tool}.approval_mode="approve"']
+        if profile.openwebui and profile.openwebui.send_files:
+            command += ["-c", 'mcp_servers.openwebui.tools.send_file.approval_mode="approve"']
         system_prompt += "\n\n" + build_instructions(profile.openwebui, bool(gateway_tools))
     if system_prompt:
         command += ["-c", "developer_instructions=" + json.dumps(system_prompt)]

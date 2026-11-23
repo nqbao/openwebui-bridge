@@ -6,7 +6,7 @@ import logging
 import os
 import time
 import uuid
-from contextlib import aclosing, asynccontextmanager
+from contextlib import aclosing, asynccontextmanager, nullcontext
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,6 +15,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from .backends import ClaudeBackend, CodexBackend, Done, Image, Text
 from .config import Profile, Settings
+from .file_delivery import collect_downloads, download_links
 from .images import ImageDeliveryError, validate_image
 from .openwebui_mcp import OpenWebUIClient, connection_env
 from .protocol import CompletionRequest, digest, replay, session_digest, uploaded_image_ids
@@ -346,6 +347,22 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 digest(result.session_id)[:12],
             )
 
+        async def turn_events(prompt, resume):
+            backend = backends[profile.backend]
+            sending_files = profile.openwebui and profile.openwebui.send_files
+            with collect_downloads() if sending_files else nullcontext() as directory:
+                parts = []
+                async with aclosing(backend.stream(profile, prompt, resume)) as events:
+                    async for event in events:
+                        if directory is not None and isinstance(event, Text):
+                            parts.append(event.content)
+                        if directory is not None and isinstance(event, Done):
+                            text = "".join(parts)
+                            for url, link in download_links(directory):
+                                if f"]({url})" not in text:
+                                    yield Text(link)
+                        yield event
+
         if not body.stream:
 
             async def collect():
@@ -360,7 +377,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
                 result = None
                 async with (
                     asyncio.timeout(timeout),
-                    aclosing(backends[profile.backend].stream(profile, prompt, resume)) as events,
+                    aclosing(turn_events(prompt, resume)) as events,
                 ):
                     async for event in events:
                         if isinstance(event, (Text, Image)):
@@ -455,7 +472,7 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
             async def produce():
                 try:
                     async with asyncio.timeout(timeout):
-                        iterator = backends[profile.backend].stream(profile, prompt, resume)
+                        iterator = turn_events(prompt, resume)
                         try:
                             async for event in iterator:
                                 await queue.put(event)

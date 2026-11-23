@@ -129,6 +129,18 @@ Use PNG, JPEG, GIF, or WebP: up to 5 MiB per image, 20 images and 20 MiB total
 per request, including history. For API clients, send inline base64 `image_url`
 parts; external image URLs are unsupported.
 
+## Send downloadable files
+
+Set `send_files = true` under `[openwebui]` and ask the assistant for a file.
+The `send_file` tool accepts a filename and UTF-8 text for exports such as CSV,
+Markdown, or JSON. For PDFs, ZIPs, and other files on disk, configure
+`file_output_dir` relative to the profile configuration and place the file directly
+inside that directory. The tool accepts its filename. The per-file limit is 10 MiB.
+
+The bridge uploads the file without indexing it and adds a download link to the
+reply. Open WebUI applies its file permissions using the configured API key's account
+as the owner.
+
 ## Display generated images
 
 Ask your Codex profile to generate a dinosaur emoji. When the profile has an

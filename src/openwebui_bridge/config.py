@@ -108,6 +108,8 @@ class OpenWebUIConfig(BaseModel):
     knowledge_ids: list[str] = Field(default_factory=list)
     # Store generated images in Open WebUI's file store; falls back to inline base64.
     upload_images: bool = True
+    send_files: bool = False
+    file_output_dir: Path | None = None
     timeout_seconds: float = Field(default=30, gt=0, le=120)
 
     @field_validator("url", mode="before")
@@ -145,6 +147,8 @@ class OpenWebUIConfig(BaseModel):
 
     def tool_names(self) -> list[str]:
         tools = []
+        if self.send_files:
+            tools.append("send_file")
         if self.knowledge:
             tools += [
                 "list_knowledge",
@@ -289,4 +293,12 @@ def load_settings(path: Path) -> Settings:
             if overrides is not None and not isinstance(overrides, dict):
                 raise ValueError("Profile openwebui must be a table or false")
             profile["openwebui"] = {**shared_openwebui, **(overrides or {})}
+        integration = profile.get("openwebui")
+        if isinstance(integration, dict) and integration.get("file_output_dir"):
+            profile["openwebui"] = {
+                **integration,
+                "file_output_dir": Path(
+                    os.path.abspath(path.parent / Path(integration["file_output_dir"]).expanduser())
+                ),
+            }
     return Settings(profiles=profiles, **server)
