@@ -386,3 +386,24 @@ async def test_coding_tools_and_specifiers(tmp_path, monkeypatch):
         assert await hook({"tool_name": name}, None, None) == {}
     for name in ("Write", "Task"):
         assert "hookSpecificOutput" in await hook({"tool_name": name}, None, None)
+
+
+def test_codex_sandbox_can_be_disabled(tmp_path):
+    def mode(**kwargs):
+        command = codex_command(
+            Profile(cwd=tmp_path, backend="codex", allowed_tools=[], **kwargs), None
+        )
+        return command[command.index("--sandbox") + 1]
+
+    assert mode() == "read-only"
+    assert mode(sandbox=True) == "read-only"
+    assert mode(sandbox=False) == "danger-full-access"
+
+
+@pytest.mark.parametrize("sandbox", [None, False, True])
+async def test_claude_sandbox_is_opt_in(tmp_path, monkeypatch, sandbox):
+    profile = Profile(cwd=tmp_path, allowed_tools=["Read", "Bash"], sandbox=sandbox)
+    client = mock_client(monkeypatch, [result()])
+    [e async for e in ClaudeBackend().stream(profile, "p", None)]
+    expected = {"enabled": True, "autoAllowBashIfSandboxed": True} if sandbox else None
+    assert client.options.sandbox == expected

@@ -183,6 +183,10 @@ class Profile(BaseModel):
     # denied unless listed in allowed_tools as "mcp__server" or "mcp__server__tool".
     project_mcp: bool = False
     codex_image_log: bool = True
+    # OS sandbox for the agent's commands. Unset keeps the backend default:
+    # Codex runs read-only, Claude unsandboxed. false gives Codex full disk and
+    # network access; true sandboxes Claude's Bash (writes limited to cwd).
+    sandbox: bool | None = None
     max_turns: int = Field(default=30, ge=1)
     openwebui: OpenWebUIConfig | None = None
 
@@ -223,12 +227,14 @@ class Profile(BaseModel):
             for tool in self.allowed_tools:
                 split_mcp_pattern(tool)
         if self.backend == "codex" and self.permission_mode != "default":
-            raise ValueError(
-                "Codex profiles use permission_mode = 'default' with a read-only sandbox"
-            )
+            raise ValueError("Codex profiles must use permission_mode = 'default'")
         if not self.cwd.is_dir():
             raise ValueError(f"Working directory does not exist: {self.cwd}")
         return self
+
+    @property
+    def sandboxed(self) -> bool:
+        return self.backend == "codex" if self.sandbox is None else self.sandbox
 
 
 class Settings(BaseModel):

@@ -231,6 +231,9 @@ class ClaudeBackend:
             ),
             allowed_tools=allowed_tools,
             permission_mode=profile.permission_mode,
+            sandbox={"enabled": True, "autoAllowBashIfSandboxed": True}
+            if profile.sandboxed
+            else None,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
@@ -384,7 +387,7 @@ def codex_command(
         "never",
         "--skip-git-repo-check",
         "--sandbox",
-        "read-only",
+        "read-only" if profile.sandboxed else "danger-full-access",
         "-c",
         'approval_policy="never"',
         "--ignore-user-config",

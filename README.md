@@ -108,7 +108,11 @@ permission_mode = "default"
 allowed_tools = []
 ```
 
-Codex uses a read-only filesystem sandbox. Title, tag, and follow-up requests
+Codex uses a read-only filesystem sandbox by default. Set `sandbox = false` on
+a Codex profile to run it without a sandbox (full disk and network access as
+the bridge's user). Claude profiles are unsandboxed by default; `sandbox = true`
+runs their Bash commands in Claude Code's sandbox (writes limited to `cwd`).
+Title, tag, and follow-up requests
 still require Claude authentication; choose a separate task model in Open WebUI
 if you only want to authenticate Codex.
 
@@ -268,7 +272,7 @@ tool, use `mcp__myserver__toolname` instead.
 | --- | --- |
 | Open WebUI cannot connect | Run `curl http://127.0.0.1:8081/health`; check the URL, Docker networking, and proxy API key. |
 | Model missing from the list | Check the profile name and `cwd`, restart the bridge, and refresh Open WebUI's model list. |
-| Agent cannot edit files | Add Claude editing tools to the profile. Codex profiles use a read-only sandbox. |
+| Agent cannot edit files | Add Claude editing tools to the profile. Codex profiles are read-only unless `sandbox = false`. |
 | Knowledge or Memory fails | Run the connection check; verify `OPENWEBUI_API_KEY`, account permissions, API endpoint restrictions, and embeddings. |
 | Follow-ups lose context | Keep user-info forwarding, custom headers, and streaming enabled. Filters that rewrite history can force a fresh session. |
 | Extra title or tag requests | Choose a separate task model in Open WebUI, or set `[server]`'s `task_model` (default `"haiku"`). |
