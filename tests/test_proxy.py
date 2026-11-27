@@ -36,7 +36,7 @@ class FakeBackend:
 
 
 @asynccontextmanager
-async def client_for(tmp_path, backend=None, **kwargs):
+async def client_for(tmp_path, backend=None, *, dump_rejected_messages=None, **kwargs):
     backend = backend or FakeBackend()
     profile = Profile(cwd=tmp_path)
     settings = Settings(
@@ -44,7 +44,7 @@ async def client_for(tmp_path, backend=None, **kwargs):
         database=tmp_path / "sessions.db",
         **kwargs,
     )
-    app = create_app(settings, {"claude": backend})
+    app = create_app(settings, {"claude": backend}, dump_rejected_messages=dump_rejected_messages)
     async with (
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
@@ -515,6 +515,39 @@ async def test_tool_history_still_requires_valid_user_turn(tmp_path, history):
         assert backend.calls == []
 
 
+async def test_openwebui_skill_manifest_is_ignored_before_agent_runs(tmp_path):
+    history = [
+        msg("user", "first turn"),
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "fc_skills",
+                    "type": "function",
+                    "function": {"name": "list_available_skills", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            **msg("tool", "<available_skills>frontend skill list</available_skills>"),
+            "tool_call_id": "fc_skills",
+        },
+    ]
+    async with client_for(tmp_path) as (client, backend, _):
+        response = await complete(client, history)
+        assert response.status_code == 200
+        assert backend.calls[-1][1:] == ("first turn", None)
+
+        history[-1]["tool_call_id"] = "unrelated"
+        assert (await complete(client, history)).status_code == 400
+
+        history[-1]["tool_call_id"] = "fc_skills"
+        history[-2]["tool_calls"][0]["function"]["name"] = "another_tool"
+        assert (await complete(client, history)).status_code == 400
+        assert len(backend.calls) == 1
+
+
 async def test_nonstreaming_completion_is_tool_free_and_preserves_session(tmp_path):
     async with client_for(tmp_path, api_key="private-api-key") as (client, backend, _):
         client.headers["Authorization"] = "Bearer private-api-key"
@@ -622,9 +655,49 @@ async def test_rejection_logs_reason_without_prompt_or_api_key(tmp_path, caplog)
         response = await complete(client, [msg("user", "private-prompt")], n=2)
         assert response.status_code == 400
         assert "Only n=1 is supported" in caplog.text
+        assert "final_roles=user" in caplog.text
         assert "private-prompt" not in caplog.text
         assert "private-api-key" not in caplog.text
         assert backend.calls == []
+
+        caplog.clear()
+        response = await complete(
+            client, [msg("user", "private-prompt"), msg("assistant", "private-reply")]
+        )
+        assert response.status_code == 400
+        assert "final_roles=user,assistant" in caplog.text
+        assert "private-" not in caplog.text
+        assert backend.calls == []
+
+
+async def test_dump_rejected_messages_preserves_raw_tool_history(tmp_path, caplog):
+    path = tmp_path / "rejected.jsonl"
+    messages = [
+        msg("user", "private-prompt"),
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1"}]},
+        {**msg("tool", "private-result"), "tool_call_id": "call_1"},
+    ]
+    async with client_for(tmp_path, api_key="private-api-key", dump_rejected_messages=path) as (
+        client,
+        backend,
+        _,
+    ):
+        assert (await complete(client, messages)).status_code == 401
+        assert not path.exists()
+
+        client.headers["Authorization"] = "Bearer private-api-key"
+        assert (await complete(client, messages[:1])).status_code == 200
+        assert not path.exists()
+
+        for _ in range(2):
+            response = await complete(client, messages)
+            assert response.status_code == 400
+            assert "private-" not in response.text
+
+        assert len(backend.calls) == 1
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert [json.loads(line) for line in path.read_text().splitlines()] == [messages, messages]
+        assert "private-" not in caplog.text
 
 
 async def test_nonstreaming_disconnect_cancels_backend(tmp_path):

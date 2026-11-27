@@ -4,9 +4,11 @@ import hmac
 import json
 import logging
 import os
+import stat
 import time
 import uuid
 from contextlib import aclosing, asynccontextmanager, nullcontext
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -81,7 +83,30 @@ def usage_payload(usage: dict) -> dict:
     }
 
 
-def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
+def append_rejected_messages(path: Path, messages: list) -> None:
+    def open_private_file(filename, flags):
+        fd = os.open(filename, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise PermissionError(
+                    "Dump file must be a private regular file owned by the service user"
+                )
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    with open(path, "a", encoding="utf-8", opener=open_private_file) as output:
+        output.write(json.dumps(messages) + "\n")
+
+
+def create_app(
+    settings: Settings,
+    backends: dict | None = None,
+    *,
+    dump_rejected_messages: Path | None = None,
+) -> FastAPI:
     locks = ChatLocks()
     backends = backends or {"claude": ClaudeBackend(), "codex": CodexBackend()}
 
@@ -107,12 +132,29 @@ def create_app(settings: Settings, backends: dict | None = None) -> FastAPI:
         if _request.url.path == "/v1/chat/completions":
             body = exc.body if isinstance(exc.body, dict) else {}
             stream = body.get("stream", False)
-            # Log only the stream flag and validation reason, never the body or
-            # headers. stream=false suggests a WebUI task but is not proof.
+            raw_messages = body.get("messages")
+            roles = []
+            if isinstance(raw_messages, list):
+                for message in raw_messages[-8:]:
+                    role = message.get("role") if isinstance(message, dict) else None
+                    roles.append(
+                        role
+                        if role in ("system", "developer", "user", "assistant", "tool", "function")
+                        else "invalid"
+                    )
+                if dump_rejected_messages is not None:
+                    try:
+                        append_rejected_messages(dump_rejected_messages, raw_messages)
+                    except OSError as error:
+                        logger.warning(
+                            "Could not write rejected message dump (%s)", type(error).__name__
+                        )
+            # Only log recognized roles and request metadata, without message text.
             logger.warning(
-                "Rejected completion request: stream=%s; task=%s; %s",
+                "Rejected completion request: stream=%s; task=%s; final_roles=%s; %s",
                 stream if isinstance(stream, bool) else "invalid",
                 task_label(_request),
+                ",".join(roles) or "none",
                 reason,
             )
         return JSONResponse(error_payload(reason), status_code=400)

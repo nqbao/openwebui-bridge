@@ -105,6 +105,40 @@ class Message(BaseModel):
         return {"role": self.role, "content": content}
 
 
+def ends_with_openwebui_skill_manifest(messages: list) -> bool:
+    if len(messages) < 3:
+        return False
+    assistant, result = messages[-2:]
+    if not isinstance(assistant, dict) or not isinstance(result, dict):
+        return False
+    if (
+        assistant.get("role") != "assistant"
+        or assistant.get("content") not in (None, "", [])
+        or assistant.get("function_call")
+        or result.get("role") != "tool"
+    ):
+        return False
+    calls = assistant.get("tool_calls")
+    if not isinstance(calls, list) or len(calls) != 1:
+        return False
+    (call,) = calls
+    if not isinstance(call, dict):
+        return False
+    function = call.get("function")
+    content = result.get("content")
+    manifest = content.strip() if isinstance(content, str) else ""
+    return (
+        call.get("type") == "function"
+        and isinstance(call.get("id"), str)
+        and bool(call["id"])
+        and call["id"] == result.get("tool_call_id")
+        and isinstance(function, dict)
+        and function.get("name") == "list_available_skills"
+        and manifest.startswith("<available_skills>")
+        and manifest.endswith("</available_skills>")
+    )
+
+
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     model: str
@@ -122,9 +156,12 @@ class CompletionRequest(BaseModel):
     @field_validator("messages", mode="before")
     @classmethod
     def ignore_client_tool_history(cls, messages):
-        if not isinstance(messages, list):
+        if not isinstance(messages, list) or not messages:
             return messages
-        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") != "user":
+        # Open WebUI may append a synthetic skill inventory before the first
+        # model call. Allow the existing tool-history cleanup to discard it.
+        last = messages[-3] if ends_with_openwebui_skill_manifest(messages) else messages[-1]
+        if isinstance(last, dict) and last.get("role") != "user":
             raise ValueError("The transcript must end with a user message")
         cleaned = []
         calls = replies = 0

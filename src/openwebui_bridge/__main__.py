@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 from pathlib import Path
 
 import uvicorn
@@ -11,6 +12,12 @@ from .config import load_settings
 def main():
     parser = argparse.ArgumentParser(description="Host-local OpenAI-compatible agent proxy")
     parser.add_argument("--config", type=Path, default=Path("profiles.toml"))
+    parser.add_argument(
+        "--dump-rejected-messages",
+        type=Path,
+        default=os.environ.get("BRIDGE_DUMP_REJECTED_MESSAGES") or None,
+        help="Append rejected completion messages to a private JSONL file",
+    )
     args = parser.parse_args()
     settings = load_settings(args.config)
     proxy_logger = logging.getLogger("openwebui_bridge")
@@ -20,7 +27,11 @@ def main():
     proxy_logger.setLevel(logging.INFO)
     proxy_logger.propagate = False
     uvicorn.run(
-        create_app(settings), host=settings.host, port=settings.port, workers=1, access_log=False
+        create_app(settings, dump_rejected_messages=args.dump_rejected_messages),
+        host=settings.host,
+        port=settings.port,
+        workers=1,
+        access_log=False,
     )
 
 
